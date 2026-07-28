@@ -2448,6 +2448,61 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--modelctl-capabilities"},
+        "print backend capabilities for modelctl and exit (JSON)",
+        [](common_params &) {
+            ggml_backend_load_all();
+            // Collect available devices.
+            std::string devices_json = "[\"CPU\"";
+            std::vector<std::string> sycl_devices;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                const char * name = ggml_backend_dev_name(dev);
+                if (name && std::string(name).find("SYCL") != std::string::npos) {
+                    sycl_devices.push_back(name);
+                }
+            }
+            for (const auto & d : sycl_devices) {
+                devices_json += ",\"" + d + "\"";
+            }
+            devices_json += "]";
+
+            // Detect MoE expert cache support.
+            // This fork always includes the cache module when built with SYCL.
+            const bool moe_cache = true;
+            // These will be set to true as each sub-feature is implemented.
+            const bool moe_cache_sycl     = false;
+            const bool moe_hybrid_cpu_miss = false;
+            const bool moe_cache_metrics   = false;
+            const bool moe_cache_prefill   = false;
+            const bool moe_cache_mmap_adv  = false;
+            const bool moe_cache_prefetch  = false;
+
+            printf("{\n");
+            printf("  \"schema\": 1,\n");
+            printf("  \"backend\": \"llama.cpp\",\n");
+            printf("  \"build\": \"custom-moe-cache\",\n");
+            printf("  \"devices\": %s,\n", devices_json.c_str());
+            printf("  \"features\": {\n");
+            printf("    \"moe_expert_cache\": %s,\n", moe_cache ? "true" : "false");
+            printf("    \"moe_cache_sycl\": %s,\n", moe_cache_sycl ? "true" : "false");
+            printf("    \"moe_hybrid_cpu_miss\": %s,\n", moe_hybrid_cpu_miss ? "true" : "false");
+            printf("    \"moe_cache_metrics\": %s,\n", moe_cache_metrics ? "true" : "false");
+            printf("    \"moe_cache_prefill_policy\": %s,\n", moe_cache_prefill ? "true" : "false");
+            printf("    \"moe_cache_mmap_advice\": %s,\n", moe_cache_mmap_adv ? "true" : "false");
+            printf("    \"moe_cache_prefetch\": %s\n", moe_cache_prefetch ? "true" : "false");
+            printf("  },\n");
+            printf("  \"cli\": {\n");
+            printf("    \"cache_bytes\": \"--moe-cache-bytes\",\n");
+            printf("    \"cache_policy\": \"--moe-cache-policy\",\n");
+            printf("    \"admission_misses\": \"--moe-cache-admission-misses\",\n");
+            printf("    \"prefill_admission\": \"--moe-cache-prefill-admission\"\n");
+            printf("  }\n");
+            printf("}\n");
+            exit(0);
+        }
+    ));
+    add_opt(common_arg(
         {"-ot", "--override-tensor"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type", [](common_params & params, const std::string & value) {
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);

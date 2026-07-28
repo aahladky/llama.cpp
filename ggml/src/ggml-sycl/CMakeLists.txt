@@ -31,6 +31,7 @@ file(GLOB   SRCS "template-instances/fattn-vec*.cpp")
 list(APPEND GGML_SOURCES_SYCL ${SRCS})
 
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
+target_compile_definitions(ggml-sycl PRIVATE GGML_MOE_EXPERT_CACHE)
 
 if (WIN32)
     # To generate a Visual Studio solution, using Intel C++ Compiler for ggml-sycl is mandatory
