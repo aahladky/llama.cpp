@@ -72,10 +72,13 @@
 #include "ggml-sycl/moe-cache.hpp"
 #include <cstring>
 // Global budget set by server from --moe-cache-bytes CLI arg.
-// Zero means cache disabled.  Volatile because it's written by the
-// server thread and read by the SYCL compute thread.
 volatile size_t g_moe_cache_budget_bytes = 0;
 volatile size_t g_moe_cache_admission = 1;
+
+// Per-device cache instances, indexed by device ID.
+// Populated during lazy_init so the metrics endpoint can read stats
+// without needing access to the SYCL backend context.
+moe_expert_cache * g_moe_cache_instances[GGML_SYCL_MAX_DEVICES] = {nullptr};
 
 // Forward declaration — defined later in this file.
 static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
@@ -4476,6 +4479,7 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     ctx.moe_cache = new moe_expert_cache();
     if (ctx.moe_cache->init(cfg, ctx.stream())) {
         ctx.moe_cache_enabled = true;
+        g_moe_cache_instances[ctx.device] = ctx.moe_cache;
         fprintf(stderr, "moe_cache: initialized on device %d, %d slots, %zu bytes budget\n",
                 ctx.device, ctx.moe_cache->slot_count(),
                 ctx.moe_cache->budget_bytes());
@@ -4484,6 +4488,40 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
         delete ctx.moe_cache;
         ctx.moe_cache = nullptr;
     }
+}
+
+// Collect cache stats from all initialized caches.
+std::string moe_cache_collect_stats() {
+    std::string result = "[";
+    bool first = true;
+    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+        auto * cache = g_moe_cache_instances[dev];
+        if (cache && cache->is_initialized()) {
+            if (!first) result += ",";
+            first = false;
+            // stats_json() returns {"hits":N,...} — strip outer braces
+            // and merge into the device object.
+            std::string stats = cache->stats_json();
+            // Remove leading { and trailing }
+            if (stats.front() == '{') stats = stats.substr(1);
+            if (stats.back() == '}') stats.pop_back();
+            result += "{\"device\":\"SYCL" + std::to_string(dev) + "\"," + stats + "}";
+        }
+    }
+    result += "]";
+    return result;
+}
+
+// Reset all caches.  Returns number of devices reset.
+int moe_cache_reset_all() {
+    int count = 0;
+    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+        if (g_moe_cache_instances[dev] && g_moe_cache_instances[dev]->is_initialized()) {
+            g_moe_cache_instances[dev]->reset();
+            count++;
+        }
+    }
+    return count;
 }
 #endif
 

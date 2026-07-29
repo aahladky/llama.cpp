@@ -3,6 +3,10 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
+
+// MoE expert cache stats (defined in ggml-sycl/moe-cache integration).
+extern std::string moe_cache_collect_stats();
+extern int moe_cache_reset_all();
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -4465,10 +4469,81 @@ void server_routes::init_routes() {
             }
         }
 
+        // MoE expert cache metrics (if cache is active).
+        {
+            std::string cache_json_str = moe_cache_collect_stats();
+            if (cache_json_str != "[]") {
+                try {
+                    json cache_stats = json::parse(cache_json_str);
+                    for (const auto & dev_stats : cache_stats) {
+                        std::string dev = dev_stats.value("device", "unknown");
+                        std::string labels = "{device=\"" + dev + "\"}";
+
+                        prometheus << "# HELP llamacpp:moe_cache_hits_total MoE expert cache hits\n"
+                                   << "# TYPE llamacpp:moe_cache_hits_total counter\n"
+                                   << "llamacpp:moe_cache_hits_total" << labels
+                                   << " " << dev_stats.value("hits", (uint64_t)0) << "\n";
+
+                        prometheus << "# HELP llamacpp:moe_cache_misses_total MoE expert cache misses\n"
+                                   << "# TYPE llamacpp:moe_cache_misses_total counter\n"
+                                   << "llamacpp:moe_cache_misses_total" << labels
+                                   << " " << dev_stats.value("misses", (uint64_t)0) << "\n";
+
+                        prometheus << "# HELP llamacpp:moe_cache_evictions_total MoE expert cache evictions\n"
+                                   << "# TYPE llamacpp:moe_cache_evictions_total counter\n"
+                                   << "llamacpp:moe_cache_evictions_total" << labels
+                                   << " " << dev_stats.value("evictions", (uint64_t)0) << "\n";
+
+                        prometheus << "# HELP llamacpp:moe_cache_promotions_total MoE expert cache promotions\n"
+                                   << "# TYPE llamacpp:moe_cache_promotions_total counter\n"
+                                   << "llamacpp:moe_cache_promotions_total" << labels
+                                   << " " << dev_stats.value("promotions", (uint64_t)0) << "\n";
+
+                        prometheus << "# HELP llamacpp:moe_cache_slots Total cache slots\n"
+                                   << "# TYPE llamacpp:moe_cache_slots gauge\n"
+                                   << "llamacpp:moe_cache_slots" << labels
+                                   << " " << dev_stats.value("slot_count", 0) << "\n";
+
+                        prometheus << "# HELP llamacpp:moe_cache_slots_used Used cache slots\n"
+                                   << "# TYPE llamacpp:moe_cache_slots_used gauge\n"
+                                   << "llamacpp:moe_cache_slots_used" << labels
+                                   << " " << dev_stats.value("slots_used", 0) << "\n";
+
+                        prometheus << "# HELP llamacpp:moe_cache_hit_ratio Cache hit ratio\n"
+                                   << "# TYPE llamacpp:moe_cache_hit_ratio gauge\n"
+                                   << "llamacpp:moe_cache_hit_ratio" << labels
+                                   << " " << dev_stats.value("hit_rate", 0.0) << "\n";
+
+                        prometheus << "# HELP llamacpp:moe_cache_h2d_bytes_total Host-to-device copy bytes\n"
+                                   << "# TYPE llamacpp:moe_cache_h2d_bytes_total counter\n"
+                                   << "llamacpp:moe_cache_h2d_bytes_total" << labels
+                                   << " " << dev_stats.value("h2d_bytes", (uint64_t)0) << "\n";
+                    }
+                } catch (...) {
+                    // JSON parse failure — skip cache metrics.
+                }
+            }
+        }
+
         res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
         res->content_type = "text/plain; version=0.0.4";
         res->status = 200;
         res->data = prometheus.str();
+        return res;
+    };
+
+    this->post_cache_reset = [this](const server_http_req &) {
+        auto res = create_response();
+        extern volatile size_t g_moe_cache_budget_bytes;
+        if (g_moe_cache_budget_bytes == 0) {
+            res->error(format_error_response("MoE cache not enabled", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        int reset_count = moe_cache_reset_all();
+        json result = {{"reset_devices", reset_count}};
+        res->data = result.dump();
+        res->content_type = "application/json";
+        res->status = 200;
         return res;
     };
 
