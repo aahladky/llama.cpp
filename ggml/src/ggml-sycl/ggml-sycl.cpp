@@ -4486,6 +4486,51 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     }
 }
 
+// MoE cache hook for the scheduler: called before copying each expert
+// from host to device.  Checks the cache for the expert; on hit, copies
+// from cache slot to dst (GPU-to-GPU).  On miss, promotes to cache slot
+// and copies from cache slot to dst.  Returns true if copied from cache.
+static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name,
+                                 int32_t expert_id, const uint8_t * host_src,
+                                 size_t expert_bytes, uint8_t * dst) {
+    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backend->context;
+    if (!ctx->moe_cache_enabled || !ctx->moe_cache) return false;
+
+    int layer = moe_cache_parse_layer(tensor_name);
+    int proj  = moe_cache_parse_projection(tensor_name);
+    if (layer < 0 || proj < 0) return false;
+
+    // Check cache for this expert+projection.
+    void * cached = ctx->moe_cache->lookup(layer, expert_id, proj);
+    if (cached) {
+        // Cache hit: copy from cache slot to dst (GPU-to-GPU).
+        // dst is input_cpy->data + eid * expert_size.
+        // The compute kernel will read from input_cpy as usual.
+        ctx->stream()->memcpy(dst, cached, expert_bytes);
+        return true;
+    }
+
+    // Cache miss: promote to cache slot, then copy from cache slot to dst.
+    ctx->moe_cache->record_miss(layer, expert_id);
+    void * slot = ctx->moe_cache->promote_projection(layer, expert_id, proj, host_src);
+    if (slot) {
+        ctx->stream()->memcpy(dst, slot, expert_bytes);
+        return true;
+    }
+
+    // Promotion failed (cache full or below admission threshold):
+    // fall through to normal host-to-device copy.
+    return false;
+}
+
+// Register the hook with the scheduler.
+void ggml_backend_sycl_register_cache_hook(ggml_backend_t backend) {
+    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backend->context;
+    if (ctx->moe_cache_enabled && ctx->moe_cache) {
+        ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
+    }
+}
+
 // Collect cache stats from all initialized caches.
 std::string moe_cache_collect_stats() {
     std::string result = "[";
@@ -6404,6 +6449,12 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device),
         /* .context = */ ctx
     };
+
+#ifdef GGML_MOE_EXPERT_CACHE
+    // Register the cache hook with the scheduler so it checks the cache
+    // before copying experts from host to device.
+    ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
+#endif
 
     return sycl_backend;
 }

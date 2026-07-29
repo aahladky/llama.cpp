@@ -351,6 +351,14 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // MoE expert cache hook: the scheduler calls this before copying each
+    // expert from host to device.  Returns true if the expert was copied
+    // from the cache, false if it should be copied from host.
+    typedef bool (*ggml_backend_sched_moe_cache_fn)(ggml_backend_t backend, const char * tensor_name,
+                                                      int32_t expert_id, const uint8_t * host_src,
+                                                      size_t expert_bytes, uint8_t * dst);
+    GGML_API void ggml_backend_sched_set_moe_cache_hook(ggml_backend_sched_moe_cache_fn fn);
+
     //
     // Meta backend
     //

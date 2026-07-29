@@ -27,6 +27,16 @@
 #include <sys/sysctl.h>
 #endif
 
+// MoE expert cache hook: the scheduler calls this before copying each
+// expert from host to device.  Returns true if the expert was copied from
+// the cache (cache->input_cpy), false if it should be copied from host.
+// The hook also promotes uncached experts to the cache.
+// Registered by the SYCL backend via ggml_backend_sched_set_moe_cache_hook.
+static ggml_backend_sched_moe_cache_fn s_moe_cache_copy = nullptr;
+void ggml_backend_sched_set_moe_cache_hook(ggml_backend_sched_moe_cache_fn fn) {
+    s_moe_cache_copy = fn;
+}
+
 
 // backend buffer type
 
@@ -1628,6 +1638,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+
+                        // MoE cache hook: check each expert against the cache.
+                        // The hook copies from cache if hit, or from host+promotes if miss.
+                        if (s_moe_cache_copy) {
+                            for (int32_t eid = first_id; eid <= last_id; eid++) {
+                                const uint8_t * src = (const uint8_t *)input->data + eid * expert_size;
+                                uint8_t * dst = (uint8_t *)input_cpy->data + eid * expert_size;
+                                bool from_cache = s_moe_cache_copy(
+                                    split_backend, input->name, eid, src, expert_size, dst);
+                                if (!from_cache) {
+                                    // Not in cache: copy from host to input_cpy.
+                                    // The hook already promoted to cache slot.
+                                    ggml_backend_tensor_set_async(split_backend,
+                                        input_cpy, src, eid * expert_size,
+                                        expert_size + padding_end);
+                                }
+                                // If from_cache: hook already copied from cache to input_cpy.
+                            }
+                            return;
+                        }
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
