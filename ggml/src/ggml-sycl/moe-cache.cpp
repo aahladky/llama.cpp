@@ -31,6 +31,9 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
     m_n_experts    = cfg.n_experts;
     m_expert_bytes = cfg.expert_bytes;
     m_admission_misses = std::max(1, cfg.admission_misses);
+    m_prefill_admit   = cfg.prefill_admit;
+    m_is_prefill      = false;
+    m_use_slru        = (cfg.policy == "slru");
 
     size_t slot_bytes = cfg.gate_bytes + cfg.up_bytes + cfg.down_bytes;
     if (slot_bytes == 0) {
@@ -40,6 +43,7 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
     if (n_slots <= 0) {
         return false;
     }
+    m_protected_limit = m_use_slru ? std::max(1, (int)(n_slots * 0.8)) : 0;
 
     m_slots.resize(n_slots);
     for (int i = 0; i < n_slots; i++) {
@@ -75,7 +79,7 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
     return true;
 }
 
-void * moe_expert_cache::lookup(int32_t layer, int32_t expert) {
+void * moe_expert_cache::lookup(int32_t layer, int32_t expert, int projection) {
     if (!m_initialized || layer < 0 || layer >= m_n_layers ||
         expert < 0 || expert >= m_n_experts) {
         m_stats.misses++;
@@ -88,14 +92,38 @@ void * moe_expert_cache::lookup(int32_t layer, int32_t expert) {
         m_slots[slot_id].occupied &&
         m_slots[slot_id].key.layer == layer &&
         m_slots[slot_id].key.expert == expert) {
+        // Check that the requested projection is filled.
+        const moe_cache_slot & s = m_slots[slot_id];
+        bool filled = false;
+        switch (projection) {
+            case 0: filled = (s.filled_mask & 1) != 0; break;  // gate
+            case 1: filled = (s.filled_mask & 2) != 0; break;  // up
+            case 2: filled = (s.filled_mask & 4) != 0; break;  // down
+        }
+        if (!filled) {
+            m_stats.misses++;
+            if (m_is_prefill) m_stats.prefill_misses++;
+            else              m_stats.decode_misses++;
+            return nullptr;
+        }
         touch(slot_id);
         m_stats.hits++;
         m_stats.gpu_expert_calls++;
+        if (m_is_prefill) m_stats.prefill_hits++;
+        else              m_stats.decode_hits++;
         m_miss_counts[layer * m_n_experts + expert] = 0;
+
+        // SLRU: promote probationary slot to protected on second access.
+        if (m_use_slru && !m_slots[slot_id].protected_seg &&
+            m_slots[slot_id].access_count >= 2) {
+            promote_to_protected(slot_id);
+        }
         return m_slots[slot_id].device_ptr;
     }
 
     m_stats.misses++;
+    if (m_is_prefill) m_stats.prefill_misses++;
+    else              m_stats.decode_misses++;
     return nullptr;
 }
 
@@ -104,74 +132,75 @@ void moe_expert_cache::record_miss(int32_t layer, int32_t expert) {
         expert < 0 || expert >= m_n_experts) {
         return;
     }
+    // Prefill protection: don't increment miss counts during prefill
+    // unless prefill admission is explicitly enabled.
+    if (m_is_prefill && !m_prefill_admit) {
+        return;
+    }
     m_miss_counts[layer * m_n_experts + expert]++;
 }
 
-void * moe_expert_cache::promote(int32_t layer, int32_t expert,
-                                  const void * host_src_gate,
-                                  const void * host_src_up,
-                                  const void * host_src_down) {
-    if (!m_initialized) return nullptr;
+void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
+                                             int projection, const void * host_src) {
+    if (!m_initialized || !host_src) return nullptr;
 
     int idx = layer * m_n_experts + expert;
     if (m_miss_counts[idx] < m_admission_misses) {
         return nullptr;
     }
 
-    int slot_id = -1;
-    for (int i = 0; i < (int)m_slots.size(); i++) {
-        if (!m_slots[i].occupied) {
-            slot_id = i;
-            break;
+    // Find existing slot for this expert, or allocate a new one.
+    int slot_id = m_layer_index[layer].expert_to_slot[expert];
+    if (slot_id < 0) {
+        // Allocate a new slot.
+        for (int i = 0; i < (int)m_slots.size(); i++) {
+            if (!m_slots[i].occupied) {
+                slot_id = i;
+                break;
+            }
         }
-    }
-    if (slot_id < 0) {
-        slot_id = evict_lru();
-    }
-    if (slot_id < 0) {
-        return nullptr;
+        if (slot_id < 0) {
+            slot_id = m_use_slru ? evict_slru() : evict_lru();
+        }
+        if (slot_id < 0) return nullptr;
+
+        moe_cache_slot & slot = m_slots[slot_id];
+        if (slot.occupied && slot.key.valid()) {
+            m_layer_index[slot.key.layer].expert_to_slot[slot.key.expert] = -1;
+            m_stats.evictions++;
+        }
+        slot.key = {layer, expert};
+        slot.occupied = true;
+        slot.filled_mask = 0;
+        slot.last_access = m_tick;
+        slot.access_count = 1;
+        slot.protected_seg = false;
+        m_layer_index[layer].expert_to_slot[expert] = slot_id;
     }
 
     moe_cache_slot & slot = m_slots[slot_id];
 
-    if (slot.occupied && slot.key.valid()) {
-        m_layer_index[slot.key.layer].expert_to_slot[slot.key.expert] = -1;
-        m_stats.evictions++;
+    // Copy this projection from host to device.
+    size_t offset = 0;
+    size_t bytes = 0;
+    uint8_t bit = 0;
+    switch (projection) {
+        case 0: offset = slot.gate_offset; bytes = slot.gate_bytes; bit = 1; break;
+        case 1: offset = slot.up_offset;   bytes = slot.up_bytes;   bit = 2; break;
+        case 2: offset = slot.down_offset; bytes = slot.down_bytes; bit = 4; break;
+        default: return nullptr;
     }
+    if (bytes == 0) return nullptr;
 
-    size_t total_bytes = 0;
     try {
-        if (host_src_gate && slot.gate_bytes > 0) {
-            m_queue->memcpy(
-                (char *)slot.device_ptr + slot.gate_offset,
-                host_src_gate, slot.gate_bytes).wait();
-            total_bytes += slot.gate_bytes;
-        }
-        if (host_src_up && slot.up_bytes > 0) {
-            m_queue->memcpy(
-                (char *)slot.device_ptr + slot.up_offset,
-                host_src_up, slot.up_bytes).wait();
-            total_bytes += slot.up_bytes;
-        }
-        if (host_src_down && slot.down_bytes > 0) {
-            m_queue->memcpy(
-                (char *)slot.device_ptr + slot.down_offset,
-                host_src_down, slot.down_bytes).wait();
-            total_bytes += slot.down_bytes;
-        }
+        m_queue->memcpy((char *)slot.device_ptr + offset, host_src, bytes).wait();
     } catch (const sycl::exception & e) {
-        fprintf(stderr, "moe_cache: promote failed: %s\n", e.what());
+        fprintf(stderr, "moe_cache: promote_projection failed: %s\n", e.what());
         return nullptr;
     }
 
-    m_stats.h2d_bytes += total_bytes;
-
-    slot.key = {layer, expert};
-    slot.occupied = true;
-    slot.last_access = m_tick;
-    slot.access_count = 1;
-
-    m_layer_index[layer].expert_to_slot[expert] = slot_id;
+    m_stats.h2d_bytes += bytes;
+    slot.filled_mask |= bit;
     m_miss_counts[idx] = 0;
     m_stats.promotions++;
 
@@ -184,6 +213,8 @@ void moe_expert_cache::reset() {
         slot.key = {-1, -1};
         slot.last_access = 0;
         slot.access_count = 0;
+        slot.protected_seg = false;
+        slot.filled_mask = 0;
     }
     for (auto & idx : m_layer_index) {
         std::fill(idx.expert_to_slot.begin(), idx.expert_to_slot.end(), -1);
@@ -212,11 +243,19 @@ std::string moe_expert_cache::stats_json() const {
     ss << "\"gpu_expert_calls\":" << m_stats.gpu_expert_calls.load() << ",";
     ss << "\"cpu_expert_calls\":" << m_stats.cpu_expert_calls.load() << ",";
     ss << "\"sync_wait_ns\":" << m_stats.sync_wait_ns.load() << ",";
+    ss << "\"prefill_hits\":" << m_stats.prefill_hits.load() << ",";
+    ss << "\"prefill_misses\":" << m_stats.prefill_misses.load() << ",";
+    ss << "\"decode_hits\":" << m_stats.decode_hits.load() << ",";
+    ss << "\"decode_misses\":" << m_stats.decode_misses.load() << ",";
+    ss << "\"slru_promotions\":" << m_stats.slru_promotions.load() << ",";
+    ss << "\"slru_demotions\":" << m_stats.slru_demotions.load() << ",";
     ss << "\"slot_count\":" << m_slots.size() << ",";
     ss << "\"slots_used\":" << slots_used() << ",";
     ss << "\"budget_bytes\":" << m_budget_bytes;
     uint64_t total = m_stats.hits.load() + m_stats.misses.load();
     ss << ",\"hit_rate\":" << (total > 0 ? (double)m_stats.hits.load() / total : 0.0);
+    uint64_t d_total = m_stats.decode_hits.load() + m_stats.decode_misses.load();
+    ss << ",\"decode_hit_rate\":" << (d_total > 0 ? (double)m_stats.decode_hits.load() / d_total : 0.0);
     ss << "}";
     return ss.str();
 }
@@ -237,4 +276,71 @@ int moe_expert_cache::evict_lru() {
 void moe_expert_cache::touch(int slot_id) {
     m_slots[slot_id].last_access = m_tick;
     m_slots[slot_id].access_count++;
+}
+
+int moe_expert_cache::evict_slru() {
+    // SLRU eviction: try probationary segment first.
+    // Only evict from protected if probationary is empty.
+    int victim = -1;
+    uint64_t oldest = UINT64_MAX;
+
+    // First pass: probationary (non-protected) slots.
+    for (int i = 0; i < (int)m_slots.size(); i++) {
+        if (m_slots[i].occupied && !m_slots[i].protected_seg &&
+            m_slots[i].last_access < oldest) {
+            oldest = m_slots[i].last_access;
+            victim = i;
+        }
+    }
+    if (victim >= 0) return victim;
+
+    // Second pass: protected slots (demote LRU protected to probationary,
+    // then evict the now-probationary slot).
+    oldest = UINT64_MAX;
+    for (int i = 0; i < (int)m_slots.size(); i++) {
+        if (m_slots[i].occupied && m_slots[i].protected_seg &&
+            m_slots[i].last_access < oldest) {
+            oldest = m_slots[i].last_access;
+            victim = i;
+        }
+    }
+    if (victim >= 0) {
+        m_slots[victim].protected_seg = false;
+        m_stats.slru_demotions++;
+    }
+    return victim;
+}
+
+void moe_expert_cache::promote_to_protected(int slot_id) {
+    // Count current protected slots.
+    int protected_count = 0;
+    for (const auto & s : m_slots) {
+        if (s.occupied && s.protected_seg) protected_count++;
+    }
+
+    if (protected_count < m_protected_limit) {
+        // Room in protected segment -- promote directly.
+        m_slots[slot_id].protected_seg = true;
+        m_stats.slru_promotions++;
+        return;
+    }
+
+    // Protected segment is full: demote LRU protected slot to probationary,
+    // then promote the new hot slot.
+    int demote = -1;
+    uint64_t oldest = UINT64_MAX;
+    for (int i = 0; i < (int)m_slots.size(); i++) {
+        if (m_slots[i].occupied && m_slots[i].protected_seg &&
+            i != slot_id &&
+            m_slots[i].last_access < oldest) {
+            oldest = m_slots[i].last_access;
+            demote = i;
+        }
+    }
+    if (demote >= 0) {
+        m_slots[demote].protected_seg = false;
+        m_stats.slru_demotions++;
+    }
+    m_slots[slot_id].protected_seg = true;
+    m_stats.slru_promotions++;
 }

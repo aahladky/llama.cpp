@@ -7,6 +7,7 @@
 // MoE expert cache stats (defined in ggml-sycl/moe-cache integration).
 extern std::string moe_cache_collect_stats();
 extern int moe_cache_reset_all();
+extern void moe_cache_set_phase_all(bool is_prefill);
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"

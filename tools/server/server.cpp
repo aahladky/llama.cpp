@@ -19,7 +19,7 @@
 #include <thread> // for std::thread::hardware_concurrency
 
 // Forward declaration for MoE cache (defined in ggml-sycl).
-class moe_expert_cache;
+struct moe_expert_cache;
 
 #if defined(_WIN32)
 #include <windows.h>

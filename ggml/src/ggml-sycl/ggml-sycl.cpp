@@ -4427,24 +4427,16 @@ static int moe_cache_parse_layer(const char * name) {
     return atoi(name + 4);
 }
 
-// Derive a cache key that distinguishes gate/up/down tensors.
-// Uses the tensor name hash to avoid collisions when caching
-// different projections of the same expert.
-static int32_t moe_cache_key_offset(const char * name, int n_experts) {
-    if (!name) return 0;
-    // Simple hash of the tensor name suffix (after "blk.N.").
-    const char * dot = strchr(name, '.');
-    if (!dot) return 0;
-    dot = strchr(dot + 1, '.');
-    if (!dot) return 0;
-    dot++; // skip second dot -> "ffn_gate_exps"
-    uint32_t h = 0;
-    for (const char * p = dot; *p; p++) {
-        h = h * 31 + (uint8_t)*p;
-    }
-    // Map to [0, n_experts) range so the combined key stays within bounds.
-    return (int)(h % (uint32_t)n_experts) * n_experts;
+// Determine projection type from tensor name: 0=gate, 1=up, 2=down, -1=unknown.
+static int moe_cache_parse_projection(const char * name) {
+    if (!name) return -1;
+    if (strstr(name, "gate_exps") || strstr(name, "gate_up_exps")) return 0;
+    if (strstr(name, "up_exps"))   return 1;
+    if (strstr(name, "down_exps")) return 2;
+    return -1;
 }
+
+// Derive projection from tensor name.
 
 // Lazy cache initialization: first call with cache enabled but not yet
 // created.  Uses src0 tensor geometry to size the cache.
@@ -4523,6 +4515,15 @@ int moe_cache_reset_all() {
     }
     return count;
 }
+
+// Set inference phase on all caches (true=prefill, false=decode).
+void moe_cache_set_phase_all(bool is_prefill) {
+    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+        if (g_moe_cache_instances[dev] && g_moe_cache_instances[dev]->is_initialized()) {
+            g_moe_cache_instances[dev]->set_phase(is_prefill);
+        }
+    }
+}
 #endif
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
@@ -4600,8 +4601,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 #ifdef GGML_MOE_EXPERT_CACHE
             if (ctx.moe_cache_enabled && ctx.moe_cache) {
                 int layer = moe_cache_parse_layer(src0->name);
-                if (layer >= 0) {
-                    void * cached = ctx.moe_cache->lookup(layer, i02);
+                int proj  = moe_cache_parse_projection(src0->name);
+                if (layer >= 0 && proj >= 0) {
+                    void * cached = ctx.moe_cache->lookup(layer, i02, proj);
                     if (cached) {
                         src0_row.data = (char *)cached;
                         src1_row.data = src1_original + i11*nb11 + i12*nb12;
@@ -4610,6 +4612,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                         continue;
                     }
                     ctx.moe_cache->record_miss(layer, i02);
+                    // Try to promote this projection after the miss.
+                    ctx.moe_cache->promote_projection(layer, i02, proj,
+                                                       src0_original + i02*nb02);
                 }
             }
 #endif
@@ -4682,8 +4687,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             // On miss, fall through to the normal compute path.
             if (ctx.moe_cache_enabled && ctx.moe_cache) {
                 int layer = moe_cache_parse_layer(src0->name);
-                if (layer >= 0) {
-                    void * cached = ctx.moe_cache->lookup(layer, (int)i02);
+                int proj  = moe_cache_parse_projection(src0->name);
+                if (layer >= 0 && proj >= 0) {
+                    void * cached = ctx.moe_cache->lookup(layer, (int)i02, proj);
                     if (cached) {
                         // Cache hit: compute using cached expert weights.
                         src0_row.data = (char *)cached;
@@ -4702,6 +4708,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                     }
                     // Cache miss: record for admission policy.
                     ctx.moe_cache->record_miss(layer, (int)i02);
+                    // Try to promote this projection after the miss.
+                    ctx.moe_cache->promote_projection(layer, (int)i02, proj,
+                                                       src0_original + i02*nb02);
                 }
             }
 #endif
