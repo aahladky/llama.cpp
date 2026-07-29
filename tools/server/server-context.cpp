@@ -2810,6 +2810,22 @@ private:
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
+
+            // MoE cache phase: if any slot is still processing prompt
+            // tokens (prompt.n_tokens < task.n_tokens), this is a prefill
+            // batch; otherwise all slots are in decode mode.
+            {
+                bool has_prompt = false;
+                for (auto & slot : slots) {
+                    if (slot.is_processing() && slot.task &&
+                        slot.prompt.n_tokens() < slot.task->n_tokens()) {
+                        has_prompt = true;
+                        break;
+                    }
+                }
+                extern void moe_cache_set_phase_all(bool);
+                moe_cache_set_phase_all(has_prompt);
+            }
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));

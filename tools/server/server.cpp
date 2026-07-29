@@ -102,8 +102,10 @@ int llama_server(int argc, char ** argv) {
     {
         extern volatile size_t g_moe_cache_budget_bytes;
         extern volatile size_t g_moe_cache_admission;
+        extern volatile char   g_moe_cache_policy[];
         g_moe_cache_budget_bytes = params.moe_cache_bytes;
         g_moe_cache_admission = params.moe_cache_admission;
+        snprintf((char *)g_moe_cache_policy, 16, "%s", params.moe_cache_policy.c_str());
         if (params.moe_cache_bytes > 0) {
             SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
                     params.moe_cache_bytes, params.moe_cache_policy.c_str(),

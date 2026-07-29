@@ -143,6 +143,7 @@ void moe_expert_cache::record_miss(int32_t layer, int32_t expert) {
 void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
                                              int projection, const void * host_src) {
     if (!m_initialized || !host_src) return nullptr;
+    if (layer < 0 || layer >= m_n_layers || expert < 0 || expert >= m_n_experts) return nullptr;
 
     int idx = layer * m_n_experts + expert;
     if (m_miss_counts[idx] < m_admission_misses) {
@@ -193,7 +194,12 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
     if (bytes == 0) return nullptr;
 
     try {
-        m_queue->memcpy((char *)slot.device_ptr + offset, host_src, bytes).wait();
+        // Async copy: submit without blocking.  The copy is ordered on the
+        // same queue as subsequent compute, so the GPU serializes it before
+        // any kernel that touches this slot.  Never .wait() in the
+        // steady-state loop -- that would stall the pipeline (plan §5.1).
+        auto ev = m_queue->memcpy((char *)slot.device_ptr + offset, host_src, bytes);
+        (void)ev;  // event available if a future consumer needs explicit sync
     } catch (const sycl::exception & e) {
         fprintf(stderr, "moe_cache: promote_projection failed: %s\n", e.what());
         return nullptr;

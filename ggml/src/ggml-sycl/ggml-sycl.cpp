@@ -74,6 +74,7 @@
 // Global budget set by server from --moe-cache-bytes CLI arg.
 volatile size_t g_moe_cache_budget_bytes = 0;
 volatile size_t g_moe_cache_admission = 1;
+volatile char   g_moe_cache_policy[16] = "lru";
 
 // Per-device cache instances, indexed by device ID.
 // Populated during lazy_init so the metrics endpoint can read stats
@@ -4460,13 +4461,16 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     cfg.device_id = ctx.device;
     cfg.budget_bytes = g_moe_cache_budget_bytes;
     cfg.n_layers = 256;  // generous upper bound; actual layers are sparse
-    cfg.n_experts = (int)n_experts * 3;  // gate * n + up * n + down * n
-    cfg.expert_bytes = expert_bytes;
+    cfg.n_experts = (int)n_experts;  // per-projection expert count
+    // Slot must hold all three projections (gate+up+down).
+    // All three are typically the same size; capture each from its own
+    // tensor's nb[2] when promoted.  For now, estimate as 3x one projection.
+    cfg.expert_bytes = expert_bytes * 3;
     cfg.gate_bytes = expert_bytes;
-    cfg.up_bytes = 0;
-    cfg.down_bytes = 0;
-    cfg.policy = "lru";
-    cfg.admission_misses = 1;
+    cfg.up_bytes = expert_bytes;
+    cfg.down_bytes = expert_bytes;
+    cfg.policy = (const char *)g_moe_cache_policy;
+    cfg.admission_misses = (int)g_moe_cache_admission;
 
     ctx.moe_cache = new moe_expert_cache();
     if (ctx.moe_cache->init(cfg, ctx.stream())) {
@@ -4549,9 +4553,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 #endif
 
     if (ne12 == 1) {
-        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
-            return;
+#ifdef GGML_MOE_EXPERT_CACHE
+        // When the cache is enabled, skip the fused path entirely so the
+        // normal loop can consult the cache per expert.  The fused kernel
+        // uses original weights, not cached pointers -- gating it is the
+        // only way to get cache hits on the decode path (F3 in review).
+        if (!(ctx.moe_cache_enabled && ctx.moe_cache)) {
+#endif
+            if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+                return;
+            }
+#ifdef GGML_MOE_EXPERT_CACHE
         }
+#endif
     }
 
     std::vector<char> ids_host(ggml_nbytes(ids));

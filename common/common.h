@@ -484,7 +484,7 @@ struct common_params {
     // MoE expert cache params
     size_t moe_cache_bytes    = 0;         // per-GPU cache budget in bytes (0 = disabled)
     std::string moe_cache_policy = "lru";  // "lru" or "slru"
-    int moe_cache_admission   = 1;         // promote after N misses
+    int moe_cache_admission   = 2;         // promote after N misses (default 2 per plan)
     bool moe_cache_prefill    = false;     // admit experts during prefill
 
     common_cpu_params cpuparams;
