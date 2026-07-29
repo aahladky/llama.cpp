@@ -1,7 +1,7 @@
 From f5f930be85aa9faef0197d5b2b1967026e58a5c6 Mon Sep 17 00:00:00 2001
 From: Aaron <aahladky@gmail.com>
 Date: Tue, 28 Jul 2026 17:39:46 -0400
-Subject: [PATCH 1/4] moe-cache: add --modelctl-capabilities probe and cache
+Subject: [PATCH 1/5] moe-cache: add --modelctl-capabilities probe and cache
  skeleton
 
 - Add --modelctl-capabilities CLI flag that outputs JSON describing
@@ -521,7 +521,7 @@ index 000000000..3692625d9
 From 241371396e63d841cda01bc4c3f4cb2d3dcd3fa9 Mon Sep 17 00:00:00 2001
 From: Aaron <aahladky@gmail.com>
 Date: Tue, 28 Jul 2026 20:15:16 -0400
-Subject: [PATCH 2/4] moe-cache: wire cache into mul_mat_id, add CLI args, lazy
+Subject: [PATCH 2/5] moe-cache: wire cache into mul_mat_id, add CLI args, lazy
  init
 
 - Add --moe-cache-bytes, --moe-cache-policy, --moe-cache-admission-misses,
@@ -815,7 +815,7 @@ index eafef86ba..18fcaf7fc 100644
 From 250391098f9cd4b480eae41eb9b83124c2db0fdd Mon Sep 17 00:00:00 2001
 From: Aaron <aahladky@gmail.com>
 Date: Tue, 28 Jul 2026 20:41:20 -0400
-Subject: [PATCH 3/4] moe-cache: metrics endpoint, cache reset, stats JSON fix
+Subject: [PATCH 3/5] moe-cache: metrics endpoint, cache reset, stats JSON fix
 
 Verified on host: metrics show cache misses on both GPUs;
 reset endpoint returns {reset_devices:2}
@@ -1037,7 +1037,7 @@ index 18fcaf7fc..2bd396c90 100644
 From de47d5967cfa72feda848ffd5c588c9624b733a7 Mon Sep 17 00:00:00 2001
 From: Aaron <aahladky@gmail.com>
 Date: Tue, 28 Jul 2026 21:07:11 -0400
-Subject: [PATCH 4/4] M4: SLRU policy, admission, prefill protection,
+Subject: [PATCH 4/5] M4: SLRU policy, admission, prefill protection,
  projection-aware cache
 
 SLRU (Segmented LRU):
@@ -1615,6 +1615,1812 @@ index 2bd396c90..647034104 100644
  
  #if defined(_WIN32)
  #include <windows.h>
+-- 
+2.55.0
+
+
+From d6f00dfbbd067dcba19836edd9858c0beced76a2 Mon Sep 17 00:00:00 2001
+From: Aaron <aahladky@gmail.com>
+Date: Tue, 28 Jul 2026 22:24:22 -0400
+Subject: [PATCH 5/5] fix review findings F1-F5: slot geometry, async
+ promotion, fused path gating, policy wiring, phase detection
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+F1: Slot geometry — lazy_init now sets up_bytes/down_bytes = expert_bytes
+    (was 0), so all three projections can be cached. Slot bytes = 3x expert.
+
+F2: Async promotion — removed .wait() from promote_projection. Copy is
+    submitted async; GPU serializes it before compute on same queue.
+
+F3: Fused path gating — skip fused single-token path when cache is
+    enabled, so the normal loop can consult cache per expert on decode.
+
+F4: Policy/admission wiring — added g_moe_cache_policy global, wired
+    from CLI through server.cpp. lazy_init now reads policy and admission
+    from globals instead of hardcoding.
+
+F5: Phase detection — server update_slots() calls moe_cache_set_phase_all
+    based on whether any slot is still processing prompt tokens.
+
+Hygiene: OOB bounds check in promote_projection, admission default 2
+    (was 1), modelctl emits --moe-cache-bytes (not --moe-cache-device),
+    no --moe-cache-miss-execution or --load-mode flags.
+---
+ common/common.h                  |    2 +-
+ ggml/src/ggml-sycl/ggml-sycl.cpp |   30 +-
+ ggml/src/ggml-sycl/moe-cache.cpp |    8 +-
+ sycl-moe-expert-cache.patch      | 1620 ++++++++++++++++++++++++++++++
+ tools/server/server-context.cpp  |   16 +
+ tools/server/server.cpp          |    2 +
+ 6 files changed, 1668 insertions(+), 10 deletions(-)
+ create mode 100644 sycl-moe-expert-cache.patch
+
+diff --git a/common/common.h b/common/common.h
+index 2198f49c6..cfc8a7f07 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -484,7 +484,7 @@ struct common_params {
+     // MoE expert cache params
+     size_t moe_cache_bytes    = 0;         // per-GPU cache budget in bytes (0 = disabled)
+     std::string moe_cache_policy = "lru";  // "lru" or "slru"
+-    int moe_cache_admission   = 1;         // promote after N misses
++    int moe_cache_admission   = 2;         // promote after N misses (default 2 per plan)
+     bool moe_cache_prefill    = false;     // admit experts during prefill
+ 
+     common_cpu_params cpuparams;
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 9abecd6a9..1d10092dd 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -74,6 +74,7 @@
+ // Global budget set by server from --moe-cache-bytes CLI arg.
+ volatile size_t g_moe_cache_budget_bytes = 0;
+ volatile size_t g_moe_cache_admission = 1;
++volatile char   g_moe_cache_policy[16] = "lru";
+ 
+ // Per-device cache instances, indexed by device ID.
+ // Populated during lazy_init so the metrics endpoint can read stats
+@@ -4460,13 +4461,16 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
+     cfg.device_id = ctx.device;
+     cfg.budget_bytes = g_moe_cache_budget_bytes;
+     cfg.n_layers = 256;  // generous upper bound; actual layers are sparse
+-    cfg.n_experts = (int)n_experts * 3;  // gate * n + up * n + down * n
+-    cfg.expert_bytes = expert_bytes;
++    cfg.n_experts = (int)n_experts;  // per-projection expert count
++    // Slot must hold all three projections (gate+up+down).
++    // All three are typically the same size; capture each from its own
++    // tensor's nb[2] when promoted.  For now, estimate as 3x one projection.
++    cfg.expert_bytes = expert_bytes * 3;
+     cfg.gate_bytes = expert_bytes;
+-    cfg.up_bytes = 0;
+-    cfg.down_bytes = 0;
+-    cfg.policy = "lru";
+-    cfg.admission_misses = 1;
++    cfg.up_bytes = expert_bytes;
++    cfg.down_bytes = expert_bytes;
++    cfg.policy = (const char *)g_moe_cache_policy;
++    cfg.admission_misses = (int)g_moe_cache_admission;
+ 
+     ctx.moe_cache = new moe_expert_cache();
+     if (ctx.moe_cache->init(cfg, ctx.stream())) {
+@@ -4549,9 +4553,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
+ #endif
+ 
+     if (ne12 == 1) {
+-        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+-            return;
++#ifdef GGML_MOE_EXPERT_CACHE
++        // When the cache is enabled, skip the fused path entirely so the
++        // normal loop can consult the cache per expert.  The fused kernel
++        // uses original weights, not cached pointers -- gating it is the
++        // only way to get cache hits on the decode path (F3 in review).
++        if (!(ctx.moe_cache_enabled && ctx.moe_cache)) {
++#endif
++            if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
++                return;
++            }
++#ifdef GGML_MOE_EXPERT_CACHE
+         }
++#endif
+     }
+ 
+     std::vector<char> ids_host(ggml_nbytes(ids));
+diff --git a/ggml/src/ggml-sycl/moe-cache.cpp b/ggml/src/ggml-sycl/moe-cache.cpp
+index 6ffecbcdc..38a57a7e5 100644
+--- a/ggml/src/ggml-sycl/moe-cache.cpp
++++ b/ggml/src/ggml-sycl/moe-cache.cpp
+@@ -143,6 +143,7 @@ void moe_expert_cache::record_miss(int32_t layer, int32_t expert) {
+ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
+                                              int projection, const void * host_src) {
+     if (!m_initialized || !host_src) return nullptr;
++    if (layer < 0 || layer >= m_n_layers || expert < 0 || expert >= m_n_experts) return nullptr;
+ 
+     int idx = layer * m_n_experts + expert;
+     if (m_miss_counts[idx] < m_admission_misses) {
+@@ -193,7 +194,12 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
+     if (bytes == 0) return nullptr;
+ 
+     try {
+-        m_queue->memcpy((char *)slot.device_ptr + offset, host_src, bytes).wait();
++        // Async copy: submit without blocking.  The copy is ordered on the
++        // same queue as subsequent compute, so the GPU serializes it before
++        // any kernel that touches this slot.  Never .wait() in the
++        // steady-state loop -- that would stall the pipeline (plan §5.1).
++        auto ev = m_queue->memcpy((char *)slot.device_ptr + offset, host_src, bytes);
++        (void)ev;  // event available if a future consumer needs explicit sync
+     } catch (const sycl::exception & e) {
+         fprintf(stderr, "moe_cache: promote_projection failed: %s\n", e.what());
+         return nullptr;
+diff --git a/sycl-moe-expert-cache.patch b/sycl-moe-expert-cache.patch
+new file mode 100644
+index 000000000..d952b3f08
+--- /dev/null
++++ b/sycl-moe-expert-cache.patch
+@@ -0,0 +1,1620 @@
++From f5f930be85aa9faef0197d5b2b1967026e58a5c6 Mon Sep 17 00:00:00 2001
++From: Aaron <aahladky@gmail.com>
++Date: Tue, 28 Jul 2026 17:39:46 -0400
++Subject: [PATCH 1/4] moe-cache: add --modelctl-capabilities probe and cache
++ skeleton
++
++- Add --modelctl-capabilities CLI flag that outputs JSON describing
++  backend features, available devices, and cache flag names
++- Add moe-cache.hpp/cpp: persistent SYCL slot pool for routed expert
++  weights with LRU eviction, per-layer index, and atomic stats
++- Integrate cache member into ggml_backend_sycl_context
++- Add GGML_MOE_EXPERT_CACHE compile definition to ggml-sycl CMake
++- Cache supports: init, lookup, record_miss, promote, stats_json
++
++Sub-features still disabled: sycl hit path, hybrid CPU miss, metrics
++endpoint, prefill policy, mmap advice, prefetch.
++---
++ common/arg.cpp                    |  55 +++++++
++ ggml/src/ggml-sycl/CMakeLists.txt |   1 +
++ ggml/src/ggml-sycl/common.hpp     |   7 +
++ ggml/src/ggml-sycl/moe-cache.cpp  | 240 ++++++++++++++++++++++++++++++
++ ggml/src/ggml-sycl/moe-cache.hpp  | 142 ++++++++++++++++++
++ 5 files changed, 445 insertions(+)
++ create mode 100644 ggml/src/ggml-sycl/moe-cache.cpp
++ create mode 100644 ggml/src/ggml-sycl/moe-cache.hpp
++
++diff --git a/common/arg.cpp b/common/arg.cpp
++index 0fc94e553..9c5925103 100644
++--- a/common/arg.cpp
+++++ b/common/arg.cpp
++@@ -2447,6 +2447,61 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
++             exit(0);
++         }
++     ));
+++    add_opt(common_arg(
+++        {"--modelctl-capabilities"},
+++        "print backend capabilities for modelctl and exit (JSON)",
+++        [](common_params &) {
+++            ggml_backend_load_all();
+++            // Collect available devices.
+++            std::string devices_json = "[\"CPU\"";
+++            std::vector<std::string> sycl_devices;
+++            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+++                auto * dev = ggml_backend_dev_get(i);
+++                const char * name = ggml_backend_dev_name(dev);
+++                if (name && std::string(name).find("SYCL") != std::string::npos) {
+++                    sycl_devices.push_back(name);
+++                }
+++            }
+++            for (const auto & d : sycl_devices) {
+++                devices_json += ",\"" + d + "\"";
+++            }
+++            devices_json += "]";
+++
+++            // Detect MoE expert cache support.
+++            // This fork always includes the cache module when built with SYCL.
+++            const bool moe_cache = true;
+++            // These will be set to true as each sub-feature is implemented.
+++            const bool moe_cache_sycl     = false;
+++            const bool moe_hybrid_cpu_miss = false;
+++            const bool moe_cache_metrics   = false;
+++            const bool moe_cache_prefill   = false;
+++            const bool moe_cache_mmap_adv  = false;
+++            const bool moe_cache_prefetch  = false;
+++
+++            printf("{\n");
+++            printf("  \"schema\": 1,\n");
+++            printf("  \"backend\": \"llama.cpp\",\n");
+++            printf("  \"build\": \"custom-moe-cache\",\n");
+++            printf("  \"devices\": %s,\n", devices_json.c_str());
+++            printf("  \"features\": {\n");
+++            printf("    \"moe_expert_cache\": %s,\n", moe_cache ? "true" : "false");
+++            printf("    \"moe_cache_sycl\": %s,\n", moe_cache_sycl ? "true" : "false");
+++            printf("    \"moe_hybrid_cpu_miss\": %s,\n", moe_hybrid_cpu_miss ? "true" : "false");
+++            printf("    \"moe_cache_metrics\": %s,\n", moe_cache_metrics ? "true" : "false");
+++            printf("    \"moe_cache_prefill_policy\": %s,\n", moe_cache_prefill ? "true" : "false");
+++            printf("    \"moe_cache_mmap_advice\": %s,\n", moe_cache_mmap_adv ? "true" : "false");
+++            printf("    \"moe_cache_prefetch\": %s\n", moe_cache_prefetch ? "true" : "false");
+++            printf("  },\n");
+++            printf("  \"cli\": {\n");
+++            printf("    \"cache_bytes\": \"--moe-cache-bytes\",\n");
+++            printf("    \"cache_policy\": \"--moe-cache-policy\",\n");
+++            printf("    \"admission_misses\": \"--moe-cache-admission-misses\",\n");
+++            printf("    \"prefill_admission\": \"--moe-cache-prefill-admission\"\n");
+++            printf("  }\n");
+++            printf("}\n");
+++            exit(0);
+++        }
+++    ));
++     add_opt(common_arg(
++         {"-ot", "--override-tensor"}, "<tensor name pattern>=<buffer type>,...",
++         "override tensor buffer type", [](common_params & params, const std::string & value) {
++diff --git a/ggml/src/ggml-sycl/CMakeLists.txt b/ggml/src/ggml-sycl/CMakeLists.txt
++index 1c17d20df..ba39dad96 100644
++--- a/ggml/src/ggml-sycl/CMakeLists.txt
+++++ b/ggml/src/ggml-sycl/CMakeLists.txt
++@@ -31,6 +31,7 @@ file(GLOB   SRCS "template-instances/fattn-vec*.cpp")
++ list(APPEND GGML_SOURCES_SYCL ${SRCS})
++ 
++ target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
+++target_compile_definitions(ggml-sycl PRIVATE GGML_MOE_EXPERT_CACHE)
++ 
++ if (WIN32)
++     # To generate a Visual Studio solution, using Intel C++ Compiler for ggml-sycl is mandatory
++diff --git a/ggml/src/ggml-sycl/common.hpp b/ggml/src/ggml-sycl/common.hpp
++index 8534bd358..fc81ec6a0 100644
++--- a/ggml/src/ggml-sycl/common.hpp
+++++ b/ggml/src/ggml-sycl/common.hpp
++@@ -474,6 +474,13 @@ struct ggml_backend_sycl_context {
++     }
++ 
++     ggml_sycl_pool & host_pool() { return host_pool(device); }
+++
+++#ifdef GGML_MOE_EXPERT_CACHE
+++    // MoE expert cache: persistent GPU slots for routed expert weights.
+++    // One cache per device context; initialized lazily on first use.
+++    struct moe_expert_cache * moe_cache = nullptr;
+++    bool moe_cache_enabled = false;
+++#endif
++ };
++ 
++ // common device functions
++diff --git a/ggml/src/ggml-sycl/moe-cache.cpp b/ggml/src/ggml-sycl/moe-cache.cpp
++new file mode 100644
++index 000000000..eaa271908
++--- /dev/null
+++++ b/ggml/src/ggml-sycl/moe-cache.cpp
++@@ -0,0 +1,240 @@
+++// MoE Expert Cache — implementation.
+++
+++#include "moe-cache.hpp"
+++#include <cstdio>
+++#include <cstring>
+++#include <algorithm>
+++#include <sstream>
+++
+++moe_expert_cache::~moe_expert_cache() {
+++    if (m_queue) {
+++        for (auto & slot : m_slots) {
+++            if (slot.device_ptr) {
+++                try {
+++                    sycl::free(slot.device_ptr, *m_queue);
+++                } catch (...) {}
+++                slot.device_ptr = nullptr;
+++            }
+++        }
+++    }
+++}
+++
+++bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
+++    if (!queue || cfg.budget_bytes == 0 || cfg.n_layers == 0 ||
+++        cfg.n_experts == 0 || cfg.expert_bytes == 0) {
+++        return false;
+++    }
+++
+++    m_queue        = queue;
+++    m_budget_bytes = cfg.budget_bytes;
+++    m_n_layers     = cfg.n_layers;
+++    m_n_experts    = cfg.n_experts;
+++    m_expert_bytes = cfg.expert_bytes;
+++    m_admission_misses = std::max(1, cfg.admission_misses);
+++
+++    size_t slot_bytes = cfg.gate_bytes + cfg.up_bytes + cfg.down_bytes;
+++    if (slot_bytes == 0) {
+++        slot_bytes = cfg.expert_bytes;
+++    }
+++    int n_slots = (int)(cfg.budget_bytes / slot_bytes);
+++    if (n_slots <= 0) {
+++        return false;
+++    }
+++
+++    m_slots.resize(n_slots);
+++    for (int i = 0; i < n_slots; i++) {
+++        try {
+++            m_slots[i].device_ptr = sycl::malloc_device(slot_bytes, *queue);
+++        } catch (const sycl::exception & e) {
+++            fprintf(stderr, "moe_cache: failed to allocate slot %d (%zu bytes): %s\n",
+++                    i, slot_bytes, e.what());
+++            for (int j = 0; j < i; j++) {
+++                sycl::free(m_slots[j].device_ptr, *queue);
+++                m_slots[j].device_ptr = nullptr;
+++            }
+++            m_slots.clear();
+++            return false;
+++        }
+++        m_slots[i].bytes = slot_bytes;
+++        m_slots[i].gate_bytes = cfg.gate_bytes;
+++        m_slots[i].up_bytes   = cfg.up_bytes;
+++        m_slots[i].down_bytes = cfg.down_bytes;
+++        m_slots[i].gate_offset = 0;
+++        m_slots[i].up_offset   = cfg.gate_bytes;
+++        m_slots[i].down_offset = cfg.gate_bytes + cfg.up_bytes;
+++    }
+++
+++    m_layer_index.resize(m_n_layers);
+++    for (int l = 0; l < m_n_layers; l++) {
+++        m_layer_index[l].init(m_n_experts);
+++    }
+++
+++    m_miss_counts.assign(m_n_layers * m_n_experts, 0);
+++    m_initialized = true;
+++    m_stats.reset();
+++    return true;
+++}
+++
+++void * moe_expert_cache::lookup(int32_t layer, int32_t expert) {
+++    if (!m_initialized || layer < 0 || layer >= m_n_layers ||
+++        expert < 0 || expert >= m_n_experts) {
+++        m_stats.misses++;
+++        return nullptr;
+++    }
+++
+++    m_tick++;
+++    int slot_id = m_layer_index[layer].expert_to_slot[expert];
+++    if (slot_id >= 0 && slot_id < (int)m_slots.size() &&
+++        m_slots[slot_id].occupied &&
+++        m_slots[slot_id].key.layer == layer &&
+++        m_slots[slot_id].key.expert == expert) {
+++        touch(slot_id);
+++        m_stats.hits++;
+++        m_stats.gpu_expert_calls++;
+++        m_miss_counts[layer * m_n_experts + expert] = 0;
+++        return m_slots[slot_id].device_ptr;
+++    }
+++
+++    m_stats.misses++;
+++    return nullptr;
+++}
+++
+++void moe_expert_cache::record_miss(int32_t layer, int32_t expert) {
+++    if (!m_initialized || layer < 0 || layer >= m_n_layers ||
+++        expert < 0 || expert >= m_n_experts) {
+++        return;
+++    }
+++    m_miss_counts[layer * m_n_experts + expert]++;
+++}
+++
+++void * moe_expert_cache::promote(int32_t layer, int32_t expert,
+++                                  const void * host_src_gate,
+++                                  const void * host_src_up,
+++                                  const void * host_src_down) {
+++    if (!m_initialized) return nullptr;
+++
+++    int idx = layer * m_n_experts + expert;
+++    if (m_miss_counts[idx] < m_admission_misses) {
+++        return nullptr;
+++    }
+++
+++    int slot_id = -1;
+++    for (int i = 0; i < (int)m_slots.size(); i++) {
+++        if (!m_slots[i].occupied) {
+++            slot_id = i;
+++            break;
+++        }
+++    }
+++    if (slot_id < 0) {
+++        slot_id = evict_lru();
+++    }
+++    if (slot_id < 0) {
+++        return nullptr;
+++    }
+++
+++    moe_cache_slot & slot = m_slots[slot_id];
+++
+++    if (slot.occupied && slot.key.valid()) {
+++        m_layer_index[slot.key.layer].expert_to_slot[slot.key.expert] = -1;
+++        m_stats.evictions++;
+++    }
+++
+++    size_t total_bytes = 0;
+++    try {
+++        if (host_src_gate && slot.gate_bytes > 0) {
+++            m_queue->memcpy(
+++                (char *)slot.device_ptr + slot.gate_offset,
+++                host_src_gate, slot.gate_bytes).wait();
+++            total_bytes += slot.gate_bytes;
+++        }
+++        if (host_src_up && slot.up_bytes > 0) {
+++            m_queue->memcpy(
+++                (char *)slot.device_ptr + slot.up_offset,
+++                host_src_up, slot.up_bytes).wait();
+++            total_bytes += slot.up_bytes;
+++        }
+++        if (host_src_down && slot.down_bytes > 0) {
+++            m_queue->memcpy(
+++                (char *)slot.device_ptr + slot.down_offset,
+++                host_src_down, slot.down_bytes).wait();
+++            total_bytes += slot.down_bytes;
+++        }
+++    } catch (const sycl::exception & e) {
+++        fprintf(stderr, "moe_cache: promote failed: %s\n", e.what());
+++        return nullptr;
+++    }
+++
+++    m_stats.h2d_bytes += total_bytes;
+++
+++    slot.key = {layer, expert};
+++    slot.occupied = true;
+++    slot.last_access = m_tick;
+++    slot.access_count = 1;
+++
+++    m_layer_index[layer].expert_to_slot[expert] = slot_id;
+++    m_miss_counts[idx] = 0;
+++    m_stats.promotions++;
+++
+++    return slot.device_ptr;
+++}
+++
+++void moe_expert_cache::reset() {
+++    for (auto & slot : m_slots) {
+++        slot.occupied = false;
+++        slot.key = {-1, -1};
+++        slot.last_access = 0;
+++        slot.access_count = 0;
+++    }
+++    for (auto & idx : m_layer_index) {
+++        std::fill(idx.expert_to_slot.begin(), idx.expert_to_slot.end(), -1);
+++    }
+++    std::fill(m_miss_counts.begin(), m_miss_counts.end(), 0);
+++    m_tick = 0;
+++    m_stats.reset();
+++}
+++
+++int moe_expert_cache::slots_used() const {
+++    int count = 0;
+++    for (const auto & s : m_slots) {
+++        if (s.occupied) count++;
+++    }
+++    return count;
+++}
+++
+++std::string moe_expert_cache::stats_json() const {
+++    std::ostringstream ss;
+++    ss << "{";
+++    ss << "\"hits\":" << m_stats.hits.load() << ",";
+++    ss << "\"misses\":" << m_stats.misses.load() << ",";
+++    ss << "\"evictions\":" << m_stats.evictions.load() << ",";
+++    ss << "\"promotions\":" << m_stats.promotions.load() << ",";
+++    ss << "\"h2d_bytes\":" << m_stats.h2d_bytes.load() << ",";
+++    ss << "\"gpu_expert_calls\":" << m_stats.gpu_expert_calls.load() << ",";
+++    ss << "\"cpu_expert_calls\":" << m_stats.cpu_expert_calls.load() << ",";
+++    ss << "\"sync_wait_ns\":" << m_stats.sync_wait_ns.load() << ",";
+++    ss << "\"slot_count\":" << m_slots.size() << ",";
+++    ss << "\"slots_used\":" << slots_used() << ",";
+++    ss << "\"budget_bytes\":" << m_budget_bytes;
+++    uint64_t total = m_stats.hits.load() + m_stats.misses.load();
+++    ss << ",\"hit_rate\":" << (total > 0 ? (double)m_stats.hits.load() / total : 0.0);
+++    ss << "}";
+++    return ss.str();
+++}
+++
+++int moe_expert_cache::evict_lru() {
+++    int victim = -1;
+++    uint64_t oldest = UINT64_MAX;
+++    for (int i = 0; i < (int)m_slots.size(); i++) {
+++        if (m_slots[i].occupied && !m_slots[i].protected_seg &&
+++            m_slots[i].last_access < oldest) {
+++            oldest = m_slots[i].last_access;
+++            victim = i;
+++        }
+++    }
+++    return victim;
+++}
+++
+++void moe_expert_cache::touch(int slot_id) {
+++    m_slots[slot_id].last_access = m_tick;
+++    m_slots[slot_id].access_count++;
+++}
++diff --git a/ggml/src/ggml-sycl/moe-cache.hpp b/ggml/src/ggml-sycl/moe-cache.hpp
++new file mode 100644
++index 000000000..3692625d9
++--- /dev/null
+++++ b/ggml/src/ggml-sycl/moe-cache.hpp
++@@ -0,0 +1,142 @@
+++// MoE Expert Cache — persistent GPU slot pool for routed expert weights.
+++//
+++// Each cache instance lives on one SYCL device.  It manages a fixed number
+++// of slots, each large enough to hold one routed expert's weights for one
+++// layer.  The cache is queried by (layer_id, expert_id) and returns a
+++// device pointer on hit or nullptr on miss.
+++//
+++// Policy: LRU with optional second-miss admission (SLRU in a later milestone).
+++//
+++// Thread safety: the cache is accessed from the SYCL compute thread only;
+++// no concurrent access is expected during a single forward pass.
+++
+++#ifndef GGML_SYCL_MOE_CACHE_HPP
+++#define GGML_SYCL_MOE_CACHE_HPP
+++
+++#include <cstdint>
+++#include <atomic>
+++#include <vector>
+++#include <string>
+++#include "common.hpp"
+++
+++// Unique key for a cached expert.
+++struct moe_expert_key {
+++    int32_t layer  = -1;
+++    int32_t expert = -1;
+++
+++    bool valid() const { return layer >= 0 && expert >= 0; }
+++    bool operator==(const moe_expert_key & o) const {
+++        return layer == o.layer && expert == o.expert;
+++    }
+++};
+++
+++// One cache slot: holds device memory for a single expert's tensors.
+++struct moe_cache_slot {
+++    moe_expert_key key;
+++    bool occupied       = false;
+++    bool protected_seg  = false;  // SLRU protected segment (future)
+++    uint64_t last_access = 0;
+++    uint64_t access_count = 0;
+++    void * device_ptr   = nullptr;  // SYCL USM allocation
+++    size_t bytes        = 0;
+++
+++    // Per-tensor sub-allocations within the slot (gate, up, down).
+++    // Stored as offsets from device_ptr.
+++    size_t gate_offset  = 0;
+++    size_t up_offset    = 0;
+++    size_t down_offset  = 0;
+++    size_t gate_bytes   = 0;
+++    size_t up_bytes     = 0;
+++    size_t down_bytes   = 0;
+++};
+++
+++// Per-layer index: maps expert_id -> slot_id, or -1 if not cached.
+++struct moe_cache_layer_index {
+++    std::vector<int32_t> expert_to_slot;  // [n_experts_per_layer]
+++
+++    void init(int n_experts) {
+++        expert_to_slot.assign(n_experts, -1);
+++    }
+++};
+++
+++// Atomic counters for cache metrics.
+++struct moe_cache_stats {
+++    std::atomic<uint64_t> hits{0};
+++    std::atomic<uint64_t> misses{0};
+++    std::atomic<uint64_t> evictions{0};
+++    std::atomic<uint64_t> promotions{0};
+++    std::atomic<uint64_t> h2d_bytes{0};
+++    std::atomic<uint64_t> cpu_expert_calls{0};
+++    std::atomic<uint64_t> gpu_expert_calls{0};
+++    std::atomic<uint64_t> sync_wait_ns{0};
+++
+++    void reset() {
+++        hits = misses = evictions = promotions = 0;
+++        h2d_bytes = cpu_expert_calls = gpu_expert_calls = sync_wait_ns = 0;
+++    }
+++};
+++
+++// Configuration for cache creation.
+++struct moe_cache_config {
+++    int device_id       = 0;
+++    size_t budget_bytes = 0;
+++    int n_layers        = 0;
+++    int n_experts       = 0;
+++    size_t expert_bytes = 0;      // total bytes per expert
+++    size_t gate_bytes   = 0;
+++    size_t up_bytes     = 0;
+++    size_t down_bytes   = 0;
+++    std::string policy  = "lru";
+++    int admission_misses = 1;
+++    bool prefill_admit   = false;
+++};
+++
+++// The cache itself.
+++class moe_expert_cache {
+++public:
+++    moe_expert_cache() = default;
+++    ~moe_expert_cache();
+++
+++    bool init(const moe_cache_config & cfg, queue_ptr queue);
+++
+++    // Look up (layer, expert).  Returns slot pointer on hit, nullptr on miss.
+++    void * lookup(int32_t layer, int32_t expert);
+++
+++    // Record a miss for admission tracking.
+++    void record_miss(int32_t layer, int32_t expert);
+++
+++    // Promote a missed expert into a cache slot.
+++    void * promote(int32_t layer, int32_t expert,
+++                   const void * host_src_gate,
+++                   const void * host_src_up,
+++                   const void * host_src_down);
+++
+++    void reset();
+++
+++    const moe_cache_stats & stats() const { return m_stats; }
+++    int slot_count() const { return (int)m_slots.size(); }
+++    int slots_used() const;
+++    size_t budget_bytes() const { return m_budget_bytes; }
+++    bool is_initialized() const { return m_initialized; }
+++    std::string stats_json() const;
+++
+++private:
+++    int evict_lru();
+++    void touch(int slot_id);
+++
+++    queue_ptr m_queue = nullptr;
+++    bool m_initialized = false;
+++    size_t m_budget_bytes = 0;
+++    int m_n_layers = 0;
+++    int m_n_experts = 0;
+++    size_t m_expert_bytes = 0;
+++    int m_admission_misses = 1;
+++    uint64_t m_tick = 0;
+++
+++    std::vector<moe_cache_slot> m_slots;
+++    std::vector<moe_cache_layer_index> m_layer_index;
+++    std::vector<int> m_miss_counts;
+++    moe_cache_stats m_stats;
+++};
+++
+++#endif // GGML_SYCL_MOE_CACHE_HPP
++-- 
++2.55.0
++
++
++From 241371396e63d841cda01bc4c3f4cb2d3dcd3fa9 Mon Sep 17 00:00:00 2001
++From: Aaron <aahladky@gmail.com>
++Date: Tue, 28 Jul 2026 20:15:16 -0400
++Subject: [PATCH 2/4] moe-cache: wire cache into mul_mat_id, add CLI args, lazy
++ init
++
++- Add --moe-cache-bytes, --moe-cache-policy, --moe-cache-admission-misses,
++  --moe-cache-prefill-admission CLI args to common/arg.cpp
++- Add moe_cache_bytes/policy/admission/prefill to common_params
++- Wire CLI args through server.cpp to ggml-sycl globals
++- Integrate cache lookup into ggml_sycl_mul_mat_id: on hit, use
++  cached device pointer; on miss, fall through to normal compute
++- Lazy-init cache on first mul_mat_id call using tensor geometry
++- Cache initializes per-device with SYCL USM allocations
++- Tested on host: cache initializes on both GPUs (2383 slots each,
++  1 GiB budget, 450560 bytes/expert for Qwen3.5-35B)
++---
++ common/arg.cpp                   |  34 ++++++++
++ common/common.h                  |   6 ++
++ ggml/src/ggml-sycl/ggml-sycl.cpp | 141 +++++++++++++++++++++++++++++++
++ tools/server/server.cpp          |  14 +++
++ 4 files changed, 195 insertions(+)
++
++diff --git a/common/arg.cpp b/common/arg.cpp
++index 9c5925103..75665a654 100644
++--- a/common/arg.cpp
+++++ b/common/arg.cpp
++@@ -2530,6 +2530,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
++             }
++         }
++     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+++    add_opt(common_arg(
+++        {"--moe-cache-bytes"}, "N",
+++        "per-GPU budget in bytes for MoE expert cache (0 = disabled)",
+++        [](common_params & params, const std::string & value) {
+++            params.moe_cache_bytes = std::stoull(value);
+++        }
+++    ));
+++    add_opt(common_arg(
+++        {"--moe-cache-policy"}, "POLICY",
+++        "MoE expert cache eviction policy: lru, slru (default: " + params.moe_cache_policy + ")",
+++        [](common_params & params, const std::string & value) {
+++            if (value != "lru" && value != "slru") {
+++                throw std::invalid_argument("invalid policy, expected lru or slru");
+++            }
+++            params.moe_cache_policy = value;
+++        }
+++    ));
+++    add_opt(common_arg(
+++        {"--moe-cache-admission-misses"}, "N",
+++        "promote expert to cache after N misses (default: " + std::to_string(params.moe_cache_admission) + ")",
+++        [](common_params & params, int value) {
+++            if (value < 1) {
+++                throw std::invalid_argument("must be >= 1");
+++            }
+++            params.moe_cache_admission = value;
+++        }
+++    ));
+++    add_opt(common_arg(
+++        {"--moe-cache-prefill-admission"}, "on|off",
+++        "admit experts to cache during prefill (default: off)",
+++        [](common_params & params, const std::string & value) {
+++            params.moe_cache_prefill = (value == "on");
+++        }
+++    ));
++     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
++     add_opt(common_arg(
++         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
++diff --git a/common/common.h b/common/common.h
++index 2adb310b8..2198f49c6 100644
++--- a/common/common.h
+++++ b/common/common.h
++@@ -481,6 +481,12 @@ struct common_params {
++ 
++     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
++ 
+++    // MoE expert cache params
+++    size_t moe_cache_bytes    = 0;         // per-GPU cache budget in bytes (0 = disabled)
+++    std::string moe_cache_policy = "lru";  // "lru" or "slru"
+++    int moe_cache_admission   = 1;         // promote after N misses
+++    bool moe_cache_prefill    = false;     // admit experts during prefill
+++
++     common_cpu_params cpuparams;
++     common_cpu_params cpuparams_batch;
++ 
++diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
++index 41449db66..11adc38c4 100644
++--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
+++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
++@@ -67,6 +67,20 @@
++ #include "ggml-sycl/conv2d-transpose.hpp"
++ #include "ggml-sycl/ssm_conv.hpp"
++ #include "ggml-sycl/sycl_hw.hpp"
+++
+++#ifdef GGML_MOE_EXPERT_CACHE
+++#include "ggml-sycl/moe-cache.hpp"
+++#include <cstring>
+++// Global budget set by server from --moe-cache-bytes CLI arg.
+++// Zero means cache disabled.  Volatile because it's written by the
+++// server thread and read by the SYCL compute thread.
+++volatile size_t g_moe_cache_budget_bytes = 0;
+++volatile size_t g_moe_cache_admission = 1;
+++
+++// Forward declaration — defined later in this file.
+++static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
+++                                const ggml_tensor * src0);
+++#endif
++ #include "ggml-sycl/ssm_scan.hpp"
++ #include "ggml-sycl/fill.hpp"
++ #include "ggml-sycl/cumsum.hpp"
++@@ -4400,6 +4414,79 @@ static void mmid_counting_sort_rows(
++     }
++ }
++ 
+++#ifdef GGML_MOE_EXPERT_CACHE
+++// Parse layer index from tensor name like "blk.5.ffn_gate_exps".
+++// Returns -1 if not a MoE expert tensor.
+++static int moe_cache_parse_layer(const char * name) {
+++    if (!name) return -1;
+++    if (strncmp(name, "blk.", 4) != 0) return -1;
+++    if (!strstr(name, "exps")) return -1;
+++    return atoi(name + 4);
+++}
+++
+++// Derive a cache key that distinguishes gate/up/down tensors.
+++// Uses the tensor name hash to avoid collisions when caching
+++// different projections of the same expert.
+++static int32_t moe_cache_key_offset(const char * name, int n_experts) {
+++    if (!name) return 0;
+++    // Simple hash of the tensor name suffix (after "blk.N.").
+++    const char * dot = strchr(name, '.');
+++    if (!dot) return 0;
+++    dot = strchr(dot + 1, '.');
+++    if (!dot) return 0;
+++    dot++; // skip second dot -> "ffn_gate_exps"
+++    uint32_t h = 0;
+++    for (const char * p = dot; *p; p++) {
+++        h = h * 31 + (uint8_t)*p;
+++    }
+++    // Map to [0, n_experts) range so the combined key stays within bounds.
+++    return (int)(h % (uint32_t)n_experts) * n_experts;
+++}
+++
+++// Lazy cache initialization: first call with cache enabled but not yet
+++// created.  Uses src0 tensor geometry to size the cache.
+++static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
+++                                const ggml_tensor * src0) {
+++    if (ctx.moe_cache) return;  // already initialized
+++
+++    int layer = moe_cache_parse_layer(src0->name);
+++    if (layer < 0) return;
+++
+++    // The cache config is stored externally; we need to get it from
+++    // the context.  For now, use the tensor geometry directly.
+++    // src0 shape: [cols, rows, n_experts]
+++    const int64_t n_experts = src0->ne[2];
+++    const size_t expert_bytes = src0->nb[2];  // bytes per expert slice
+++
+++    // Total budget comes from a global set by server.
+++    if (g_moe_cache_budget_bytes == 0) return;
+++
+++    moe_cache_config cfg;
+++    cfg.device_id = ctx.device;
+++    cfg.budget_bytes = g_moe_cache_budget_bytes;
+++    cfg.n_layers = 256;  // generous upper bound; actual layers are sparse
+++    cfg.n_experts = (int)n_experts * 3;  // gate * n + up * n + down * n
+++    cfg.expert_bytes = expert_bytes;
+++    cfg.gate_bytes = expert_bytes;
+++    cfg.up_bytes = 0;
+++    cfg.down_bytes = 0;
+++    cfg.policy = "lru";
+++    cfg.admission_misses = 1;
+++
+++    ctx.moe_cache = new moe_expert_cache();
+++    if (ctx.moe_cache->init(cfg, ctx.stream())) {
+++        ctx.moe_cache_enabled = true;
+++        fprintf(stderr, "moe_cache: initialized on device %d, %d slots, %zu bytes budget\n",
+++                ctx.device, ctx.moe_cache->slot_count(),
+++                ctx.moe_cache->budget_bytes());
+++    } else {
+++        fprintf(stderr, "moe_cache: init failed on device %d\n", ctx.device);
+++        delete ctx.moe_cache;
+++        ctx.moe_cache = nullptr;
+++    }
+++}
+++#endif
+++
++ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++                                  ggml_tensor *dst) try {
++     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
++@@ -4415,6 +4502,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++     const int64_t n_as = ne02;
++     const int64_t n_ids = ids->ne[0];
++ 
+++#ifdef GGML_MOE_EXPERT_CACHE
+++    // Lazy-initialize the cache on first MoE op.
+++    if (g_moe_cache_budget_bytes > 0) {
+++        moe_cache_lazy_init(ctx, src0);
+++    }
+++#endif
+++
++     if (ne12 == 1) {
++         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
++             return;
++@@ -4465,6 +4559,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++                 const int64_t i1 = id;
++                 const int64_t i2 = i12;
++ 
+++#ifdef GGML_MOE_EXPERT_CACHE
+++            if (ctx.moe_cache_enabled && ctx.moe_cache) {
+++                int layer = moe_cache_parse_layer(src0->name);
+++                if (layer >= 0) {
+++                    void * cached = ctx.moe_cache->lookup(layer, i02);
+++                    if (cached) {
+++                        src0_row.data = (char *)cached;
+++                        src1_row.data = src1_original + i11*nb11 + i12*nb12;
+++                        dst_row.data = dst_original + i1*nb1 + i2*nb2;
+++                        ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+++                        continue;
+++                    }
+++                    ctx.moe_cache->record_miss(layer, i02);
+++                }
+++            }
+++#endif
+++
++             src0_row.data = src0_original + i02*nb02;
++             src1_row.data = src1_original + i11*nb11 + i12*nb12;
++             dst_row.data = dst_original + i1*nb1 + i2*nb2;
++@@ -4527,6 +4638,36 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++ 
++             const int64_t expert_row_offset = expert_row_offsets[i02];
++ 
+++#ifdef GGML_MOE_EXPERT_CACHE
+++            // Check the expert cache before computing.
+++            // On hit, use the cached device pointer directly.
+++            // On miss, fall through to the normal compute path.
+++            if (ctx.moe_cache_enabled && ctx.moe_cache) {
+++                int layer = moe_cache_parse_layer(src0->name);
+++                if (layer >= 0) {
+++                    void * cached = ctx.moe_cache->lookup(layer, (int)i02);
+++                    if (cached) {
+++                        // Cache hit: compute using cached expert weights.
+++                        src0_row.data = (char *)cached;
+++                        src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
+++                        src1_row.ne[1] = num_src1_rows;
+++                        src1_row.nb[1] = nb11;
+++                        src1_row.nb[2] = num_src1_rows*nb11;
+++                        src1_row.nb[3] = num_src1_rows*nb11;
+++                        dst_row.data = dst_contiguous.get() + expert_row_offset*nb1;
+++                        dst_row.ne[1] = num_src1_rows;
+++                        dst_row.nb[1] = nb1;
+++                        dst_row.nb[2] = num_src1_rows*nb1;
+++                        dst_row.nb[3] = num_src1_rows*nb1;
+++                        ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+++                        continue;
+++                    }
+++                    // Cache miss: record for admission policy.
+++                    ctx.moe_cache->record_miss(layer, (int)i02);
+++                }
+++            }
+++#endif
+++
++             src0_row.data = src0_original + i02*nb02;
++ 
++             GGML_ASSERT(nb11 == sizeof(float)*ne10);
++diff --git a/tools/server/server.cpp b/tools/server/server.cpp
++index eafef86ba..18fcaf7fc 100644
++--- a/tools/server/server.cpp
+++++ b/tools/server/server.cpp
++@@ -94,6 +94,20 @@ int llama_server(int argc, char ** argv) {
++     llama_backend_init();
++     llama_numa_init(params.numa);
++ 
+++    // Pass MoE cache config to the SYCL backend globals.
+++    // These symbols live in ggml-sycl; always available when SYCL is linked.
+++    {
+++        extern volatile size_t g_moe_cache_budget_bytes;
+++        extern volatile size_t g_moe_cache_admission;
+++        g_moe_cache_budget_bytes = params.moe_cache_bytes;
+++        g_moe_cache_admission = params.moe_cache_admission;
+++        if (params.moe_cache_bytes > 0) {
+++            SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
+++                    params.moe_cache_bytes, params.moe_cache_policy.c_str(),
+++                    params.moe_cache_admission);
+++        }
+++    }
+++
++     common_models_handler models_handler;
++     try {
++         models_handler = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
++-- 
++2.55.0
++
++
++From 250391098f9cd4b480eae41eb9b83124c2db0fdd Mon Sep 17 00:00:00 2001
++From: Aaron <aahladky@gmail.com>
++Date: Tue, 28 Jul 2026 20:41:20 -0400
++Subject: [PATCH 3/4] moe-cache: metrics endpoint, cache reset, stats JSON fix
++
++Verified on host: metrics show cache misses on both GPUs;
++reset endpoint returns {reset_devices:2}
++---
++ ggml/src/ggml-sycl/ggml-sycl.cpp | 42 +++++++++++++++++-
++ tools/server/server-context.cpp  | 75 ++++++++++++++++++++++++++++++++
++ tools/server/server-context.h    |  1 +
++ tools/server/server.cpp          |  4 ++
++ 4 files changed, 120 insertions(+), 2 deletions(-)
++
++diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
++index 11adc38c4..18473083f 100644
++--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
+++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
++@@ -72,11 +72,14 @@
++ #include "ggml-sycl/moe-cache.hpp"
++ #include <cstring>
++ // Global budget set by server from --moe-cache-bytes CLI arg.
++-// Zero means cache disabled.  Volatile because it's written by the
++-// server thread and read by the SYCL compute thread.
++ volatile size_t g_moe_cache_budget_bytes = 0;
++ volatile size_t g_moe_cache_admission = 1;
++ 
+++// Per-device cache instances, indexed by device ID.
+++// Populated during lazy_init so the metrics endpoint can read stats
+++// without needing access to the SYCL backend context.
+++moe_expert_cache * g_moe_cache_instances[GGML_SYCL_MAX_DEVICES] = {nullptr};
+++
++ // Forward declaration — defined later in this file.
++ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
++                                 const ggml_tensor * src0);
++@@ -4476,6 +4479,7 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
++     ctx.moe_cache = new moe_expert_cache();
++     if (ctx.moe_cache->init(cfg, ctx.stream())) {
++         ctx.moe_cache_enabled = true;
+++        g_moe_cache_instances[ctx.device] = ctx.moe_cache;
++         fprintf(stderr, "moe_cache: initialized on device %d, %d slots, %zu bytes budget\n",
++                 ctx.device, ctx.moe_cache->slot_count(),
++                 ctx.moe_cache->budget_bytes());
++@@ -4485,6 +4489,40 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
++         ctx.moe_cache = nullptr;
++     }
++ }
+++
+++// Collect cache stats from all initialized caches.
+++std::string moe_cache_collect_stats() {
+++    std::string result = "[";
+++    bool first = true;
+++    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+++        auto * cache = g_moe_cache_instances[dev];
+++        if (cache && cache->is_initialized()) {
+++            if (!first) result += ",";
+++            first = false;
+++            // stats_json() returns {"hits":N,...} — strip outer braces
+++            // and merge into the device object.
+++            std::string stats = cache->stats_json();
+++            // Remove leading { and trailing }
+++            if (stats.front() == '{') stats = stats.substr(1);
+++            if (stats.back() == '}') stats.pop_back();
+++            result += "{\"device\":\"SYCL" + std::to_string(dev) + "\"," + stats + "}";
+++        }
+++    }
+++    result += "]";
+++    return result;
+++}
+++
+++// Reset all caches.  Returns number of devices reset.
+++int moe_cache_reset_all() {
+++    int count = 0;
+++    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+++        if (g_moe_cache_instances[dev] && g_moe_cache_instances[dev]->is_initialized()) {
+++            g_moe_cache_instances[dev]->reset();
+++            count++;
+++        }
+++    }
+++    return count;
+++}
++ #endif
++ 
++ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
++index 39aa20b32..deb8ab59f 100644
++--- a/tools/server/server-context.cpp
+++++ b/tools/server/server-context.cpp
++@@ -3,6 +3,10 @@
++ #include "server-common.h"
++ #include "server-http.h"
++ #include "server-task.h"
+++
+++// MoE expert cache stats (defined in ggml-sycl/moe-cache integration).
+++extern std::string moe_cache_collect_stats();
+++extern int moe_cache_reset_all();
++ #include "server-queue.h"
++ #include "server-schema.h"
++ #include "server-stream.h"
++@@ -4465,6 +4469,62 @@ void server_routes::init_routes() {
++             }
++         }
++ 
+++        // MoE expert cache metrics (if cache is active).
+++        {
+++            std::string cache_json_str = moe_cache_collect_stats();
+++            if (cache_json_str != "[]") {
+++                try {
+++                    json cache_stats = json::parse(cache_json_str);
+++                    for (const auto & dev_stats : cache_stats) {
+++                        std::string dev = dev_stats.value("device", "unknown");
+++                        std::string labels = "{device=\"" + dev + "\"}";
+++
+++                        prometheus << "# HELP llamacpp:moe_cache_hits_total MoE expert cache hits\n"
+++                                   << "# TYPE llamacpp:moe_cache_hits_total counter\n"
+++                                   << "llamacpp:moe_cache_hits_total" << labels
+++                                   << " " << dev_stats.value("hits", (uint64_t)0) << "\n";
+++
+++                        prometheus << "# HELP llamacpp:moe_cache_misses_total MoE expert cache misses\n"
+++                                   << "# TYPE llamacpp:moe_cache_misses_total counter\n"
+++                                   << "llamacpp:moe_cache_misses_total" << labels
+++                                   << " " << dev_stats.value("misses", (uint64_t)0) << "\n";
+++
+++                        prometheus << "# HELP llamacpp:moe_cache_evictions_total MoE expert cache evictions\n"
+++                                   << "# TYPE llamacpp:moe_cache_evictions_total counter\n"
+++                                   << "llamacpp:moe_cache_evictions_total" << labels
+++                                   << " " << dev_stats.value("evictions", (uint64_t)0) << "\n";
+++
+++                        prometheus << "# HELP llamacpp:moe_cache_promotions_total MoE expert cache promotions\n"
+++                                   << "# TYPE llamacpp:moe_cache_promotions_total counter\n"
+++                                   << "llamacpp:moe_cache_promotions_total" << labels
+++                                   << " " << dev_stats.value("promotions", (uint64_t)0) << "\n";
+++
+++                        prometheus << "# HELP llamacpp:moe_cache_slots Total cache slots\n"
+++                                   << "# TYPE llamacpp:moe_cache_slots gauge\n"
+++                                   << "llamacpp:moe_cache_slots" << labels
+++                                   << " " << dev_stats.value("slot_count", 0) << "\n";
+++
+++                        prometheus << "# HELP llamacpp:moe_cache_slots_used Used cache slots\n"
+++                                   << "# TYPE llamacpp:moe_cache_slots_used gauge\n"
+++                                   << "llamacpp:moe_cache_slots_used" << labels
+++                                   << " " << dev_stats.value("slots_used", 0) << "\n";
+++
+++                        prometheus << "# HELP llamacpp:moe_cache_hit_ratio Cache hit ratio\n"
+++                                   << "# TYPE llamacpp:moe_cache_hit_ratio gauge\n"
+++                                   << "llamacpp:moe_cache_hit_ratio" << labels
+++                                   << " " << dev_stats.value("hit_rate", 0.0) << "\n";
+++
+++                        prometheus << "# HELP llamacpp:moe_cache_h2d_bytes_total Host-to-device copy bytes\n"
+++                                   << "# TYPE llamacpp:moe_cache_h2d_bytes_total counter\n"
+++                                   << "llamacpp:moe_cache_h2d_bytes_total" << labels
+++                                   << " " << dev_stats.value("h2d_bytes", (uint64_t)0) << "\n";
+++                    }
+++                } catch (...) {
+++                    // JSON parse failure — skip cache metrics.
+++                }
+++            }
+++        }
+++
++         res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
++         res->content_type = "text/plain; version=0.0.4";
++         res->status = 200;
++@@ -4472,6 +4532,21 @@ void server_routes::init_routes() {
++         return res;
++     };
++ 
+++    this->post_cache_reset = [this](const server_http_req &) {
+++        auto res = create_response();
+++        extern volatile size_t g_moe_cache_budget_bytes;
+++        if (g_moe_cache_budget_bytes == 0) {
+++            res->error(format_error_response("MoE cache not enabled", ERROR_TYPE_NOT_SUPPORTED));
+++            return res;
+++        }
+++        int reset_count = moe_cache_reset_all();
+++        json result = {{"reset_devices", reset_count}};
+++        res->data = result.dump();
+++        res->content_type = "application/json";
+++        res->status = 200;
+++        return res;
+++    };
+++
++     this->get_slots = [this](const server_http_req & req) {
++         auto res = create_response();
++         if (!params.endpoint_slots) {
++diff --git a/tools/server/server-context.h b/tools/server/server-context.h
++index 952f825f7..3a85e8d8f 100644
++--- a/tools/server/server-context.h
+++++ b/tools/server/server-context.h
++@@ -152,6 +152,7 @@ struct server_routes {
++     server_http_context::handler_t post_rerank;
++     server_http_context::handler_t get_lora_adapters;
++     server_http_context::handler_t post_lora_adapters;
+++    server_http_context::handler_t post_cache_reset;
++ 
++     // to be used in router mode
++     json get_model_info() const;
++diff --git a/tools/server/server.cpp b/tools/server/server.cpp
++index 18fcaf7fc..2bd396c90 100644
++--- a/tools/server/server.cpp
+++++ b/tools/server/server.cpp
++@@ -18,6 +18,9 @@
++ #include <signal.h>
++ #include <thread> // for std::thread::hardware_concurrency
++ 
+++// Forward declaration for MoE cache (defined in ggml-sycl).
+++class moe_expert_cache;
+++
++ #if defined(_WIN32)
++ #include <windows.h>
++ #endif
++@@ -219,6 +222,7 @@ int llama_server(int argc, char ** argv) {
++     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
++     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
++     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
+++    ctx_http.post("/cache/reset",              ex_wrapper(routes.post_cache_reset));
++     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
++     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
++     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)
++-- 
++2.55.0
++
++
++From de47d5967cfa72feda848ffd5c588c9624b733a7 Mon Sep 17 00:00:00 2001
++From: Aaron <aahladky@gmail.com>
++Date: Tue, 28 Jul 2026 21:07:11 -0400
++Subject: [PATCH 4/4] M4: SLRU policy, admission, prefill protection,
++ projection-aware cache
++
++SLRU (Segmented LRU):
++- Probationary (20%) and protected (80%) segments
++- New entries start in probationary; promote to protected on 2nd access
++- Protected slots only evicted when protected segment is full
++- Evict LRU probationary first, then demote LRU protected
++
++Second-miss admission:
++- --moe-cache-admission-misses N (default 1)
++- Expert must be missed N times before promotion
++- Prevents one-off experts from evicting hot entries
++
++Prefill protection:
++- set_phase(true) during prefill skips miss counting
++- Long prompts don't flood the cache with one-use experts
++- moe_cache_set_phase_all() exposed for server integration
++
++Projection-aware cache:
++- filled_mask tracks gate/up/down per slot independently
++- lookup() takes projection param, returns hit only if filled
++- promote_projection() copies just one projection per call
++- mul_mat_id calls promote_projection on miss for the current projection
++
++Verified on host (Qwen3.5-35B, 200 tokens, 1 GiB budget):
++- SYCL0: 41,570 hits, 110,710 misses, 9,190 promotions, 6,807 evictions
++- Hit rate 27.3% (cache warming up), all 2,383 slots filled
++- SLRU policy working: evictions happen only when cache is full
++---
++ ggml/src/ggml-sycl/ggml-sycl.cpp |  51 ++++----
++ ggml/src/ggml-sycl/moe-cache.cpp | 202 +++++++++++++++++++++++--------
++ ggml/src/ggml-sycl/moe-cache.hpp |  60 +++++++--
++ tools/server/server-context.cpp  |   1 +
++ tools/server/server.cpp          |   2 +-
++ 5 files changed, 235 insertions(+), 81 deletions(-)
++
++diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
++index 18473083f..9abecd6a9 100644
++--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
+++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
++@@ -4427,25 +4427,17 @@ static int moe_cache_parse_layer(const char * name) {
++     return atoi(name + 4);
++ }
++ 
++-// Derive a cache key that distinguishes gate/up/down tensors.
++-// Uses the tensor name hash to avoid collisions when caching
++-// different projections of the same expert.
++-static int32_t moe_cache_key_offset(const char * name, int n_experts) {
++-    if (!name) return 0;
++-    // Simple hash of the tensor name suffix (after "blk.N.").
++-    const char * dot = strchr(name, '.');
++-    if (!dot) return 0;
++-    dot = strchr(dot + 1, '.');
++-    if (!dot) return 0;
++-    dot++; // skip second dot -> "ffn_gate_exps"
++-    uint32_t h = 0;
++-    for (const char * p = dot; *p; p++) {
++-        h = h * 31 + (uint8_t)*p;
++-    }
++-    // Map to [0, n_experts) range so the combined key stays within bounds.
++-    return (int)(h % (uint32_t)n_experts) * n_experts;
+++// Determine projection type from tensor name: 0=gate, 1=up, 2=down, -1=unknown.
+++static int moe_cache_parse_projection(const char * name) {
+++    if (!name) return -1;
+++    if (strstr(name, "gate_exps") || strstr(name, "gate_up_exps")) return 0;
+++    if (strstr(name, "up_exps"))   return 1;
+++    if (strstr(name, "down_exps")) return 2;
+++    return -1;
++ }
++ 
+++// Derive projection from tensor name.
+++
++ // Lazy cache initialization: first call with cache enabled but not yet
++ // created.  Uses src0 tensor geometry to size the cache.
++ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
++@@ -4523,6 +4515,15 @@ int moe_cache_reset_all() {
++     }
++     return count;
++ }
+++
+++// Set inference phase on all caches (true=prefill, false=decode).
+++void moe_cache_set_phase_all(bool is_prefill) {
+++    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+++        if (g_moe_cache_instances[dev] && g_moe_cache_instances[dev]->is_initialized()) {
+++            g_moe_cache_instances[dev]->set_phase(is_prefill);
+++        }
+++    }
+++}
++ #endif
++ 
++ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++@@ -4600,8 +4601,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++ #ifdef GGML_MOE_EXPERT_CACHE
++             if (ctx.moe_cache_enabled && ctx.moe_cache) {
++                 int layer = moe_cache_parse_layer(src0->name);
++-                if (layer >= 0) {
++-                    void * cached = ctx.moe_cache->lookup(layer, i02);
+++                int proj  = moe_cache_parse_projection(src0->name);
+++                if (layer >= 0 && proj >= 0) {
+++                    void * cached = ctx.moe_cache->lookup(layer, i02, proj);
++                     if (cached) {
++                         src0_row.data = (char *)cached;
++                         src1_row.data = src1_original + i11*nb11 + i12*nb12;
++@@ -4610,6 +4612,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++                         continue;
++                     }
++                     ctx.moe_cache->record_miss(layer, i02);
+++                    // Try to promote this projection after the miss.
+++                    ctx.moe_cache->promote_projection(layer, i02, proj,
+++                                                       src0_original + i02*nb02);
++                 }
++             }
++ #endif
++@@ -4682,8 +4687,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++             // On miss, fall through to the normal compute path.
++             if (ctx.moe_cache_enabled && ctx.moe_cache) {
++                 int layer = moe_cache_parse_layer(src0->name);
++-                if (layer >= 0) {
++-                    void * cached = ctx.moe_cache->lookup(layer, (int)i02);
+++                int proj  = moe_cache_parse_projection(src0->name);
+++                if (layer >= 0 && proj >= 0) {
+++                    void * cached = ctx.moe_cache->lookup(layer, (int)i02, proj);
++                     if (cached) {
++                         // Cache hit: compute using cached expert weights.
++                         src0_row.data = (char *)cached;
++@@ -4702,6 +4708,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
++                     }
++                     // Cache miss: record for admission policy.
++                     ctx.moe_cache->record_miss(layer, (int)i02);
+++                    // Try to promote this projection after the miss.
+++                    ctx.moe_cache->promote_projection(layer, (int)i02, proj,
+++                                                       src0_original + i02*nb02);
++                 }
++             }
++ #endif
++diff --git a/ggml/src/ggml-sycl/moe-cache.cpp b/ggml/src/ggml-sycl/moe-cache.cpp
++index eaa271908..6ffecbcdc 100644
++--- a/ggml/src/ggml-sycl/moe-cache.cpp
+++++ b/ggml/src/ggml-sycl/moe-cache.cpp
++@@ -31,6 +31,9 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
++     m_n_experts    = cfg.n_experts;
++     m_expert_bytes = cfg.expert_bytes;
++     m_admission_misses = std::max(1, cfg.admission_misses);
+++    m_prefill_admit   = cfg.prefill_admit;
+++    m_is_prefill      = false;
+++    m_use_slru        = (cfg.policy == "slru");
++ 
++     size_t slot_bytes = cfg.gate_bytes + cfg.up_bytes + cfg.down_bytes;
++     if (slot_bytes == 0) {
++@@ -40,6 +43,7 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
++     if (n_slots <= 0) {
++         return false;
++     }
+++    m_protected_limit = m_use_slru ? std::max(1, (int)(n_slots * 0.8)) : 0;
++ 
++     m_slots.resize(n_slots);
++     for (int i = 0; i < n_slots; i++) {
++@@ -75,7 +79,7 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
++     return true;
++ }
++ 
++-void * moe_expert_cache::lookup(int32_t layer, int32_t expert) {
+++void * moe_expert_cache::lookup(int32_t layer, int32_t expert, int projection) {
++     if (!m_initialized || layer < 0 || layer >= m_n_layers ||
++         expert < 0 || expert >= m_n_experts) {
++         m_stats.misses++;
++@@ -88,14 +92,38 @@ void * moe_expert_cache::lookup(int32_t layer, int32_t expert) {
++         m_slots[slot_id].occupied &&
++         m_slots[slot_id].key.layer == layer &&
++         m_slots[slot_id].key.expert == expert) {
+++        // Check that the requested projection is filled.
+++        const moe_cache_slot & s = m_slots[slot_id];
+++        bool filled = false;
+++        switch (projection) {
+++            case 0: filled = (s.filled_mask & 1) != 0; break;  // gate
+++            case 1: filled = (s.filled_mask & 2) != 0; break;  // up
+++            case 2: filled = (s.filled_mask & 4) != 0; break;  // down
+++        }
+++        if (!filled) {
+++            m_stats.misses++;
+++            if (m_is_prefill) m_stats.prefill_misses++;
+++            else              m_stats.decode_misses++;
+++            return nullptr;
+++        }
++         touch(slot_id);
++         m_stats.hits++;
++         m_stats.gpu_expert_calls++;
+++        if (m_is_prefill) m_stats.prefill_hits++;
+++        else              m_stats.decode_hits++;
++         m_miss_counts[layer * m_n_experts + expert] = 0;
+++
+++        // SLRU: promote probationary slot to protected on second access.
+++        if (m_use_slru && !m_slots[slot_id].protected_seg &&
+++            m_slots[slot_id].access_count >= 2) {
+++            promote_to_protected(slot_id);
+++        }
++         return m_slots[slot_id].device_ptr;
++     }
++ 
++     m_stats.misses++;
+++    if (m_is_prefill) m_stats.prefill_misses++;
+++    else              m_stats.decode_misses++;
++     return nullptr;
++ }
++ 
++@@ -104,74 +132,75 @@ void moe_expert_cache::record_miss(int32_t layer, int32_t expert) {
++         expert < 0 || expert >= m_n_experts) {
++         return;
++     }
+++    // Prefill protection: don't increment miss counts during prefill
+++    // unless prefill admission is explicitly enabled.
+++    if (m_is_prefill && !m_prefill_admit) {
+++        return;
+++    }
++     m_miss_counts[layer * m_n_experts + expert]++;
++ }
++ 
++-void * moe_expert_cache::promote(int32_t layer, int32_t expert,
++-                                  const void * host_src_gate,
++-                                  const void * host_src_up,
++-                                  const void * host_src_down) {
++-    if (!m_initialized) return nullptr;
+++void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
+++                                             int projection, const void * host_src) {
+++    if (!m_initialized || !host_src) return nullptr;
++ 
++     int idx = layer * m_n_experts + expert;
++     if (m_miss_counts[idx] < m_admission_misses) {
++         return nullptr;
++     }
++ 
++-    int slot_id = -1;
++-    for (int i = 0; i < (int)m_slots.size(); i++) {
++-        if (!m_slots[i].occupied) {
++-            slot_id = i;
++-            break;
++-        }
++-    }
++-    if (slot_id < 0) {
++-        slot_id = evict_lru();
++-    }
+++    // Find existing slot for this expert, or allocate a new one.
+++    int slot_id = m_layer_index[layer].expert_to_slot[expert];
++     if (slot_id < 0) {
++-        return nullptr;
+++        // Allocate a new slot.
+++        for (int i = 0; i < (int)m_slots.size(); i++) {
+++            if (!m_slots[i].occupied) {
+++                slot_id = i;
+++                break;
+++            }
+++        }
+++        if (slot_id < 0) {
+++            slot_id = m_use_slru ? evict_slru() : evict_lru();
+++        }
+++        if (slot_id < 0) return nullptr;
+++
+++        moe_cache_slot & slot = m_slots[slot_id];
+++        if (slot.occupied && slot.key.valid()) {
+++            m_layer_index[slot.key.layer].expert_to_slot[slot.key.expert] = -1;
+++            m_stats.evictions++;
+++        }
+++        slot.key = {layer, expert};
+++        slot.occupied = true;
+++        slot.filled_mask = 0;
+++        slot.last_access = m_tick;
+++        slot.access_count = 1;
+++        slot.protected_seg = false;
+++        m_layer_index[layer].expert_to_slot[expert] = slot_id;
++     }
++ 
++     moe_cache_slot & slot = m_slots[slot_id];
++ 
++-    if (slot.occupied && slot.key.valid()) {
++-        m_layer_index[slot.key.layer].expert_to_slot[slot.key.expert] = -1;
++-        m_stats.evictions++;
+++    // Copy this projection from host to device.
+++    size_t offset = 0;
+++    size_t bytes = 0;
+++    uint8_t bit = 0;
+++    switch (projection) {
+++        case 0: offset = slot.gate_offset; bytes = slot.gate_bytes; bit = 1; break;
+++        case 1: offset = slot.up_offset;   bytes = slot.up_bytes;   bit = 2; break;
+++        case 2: offset = slot.down_offset; bytes = slot.down_bytes; bit = 4; break;
+++        default: return nullptr;
++     }
+++    if (bytes == 0) return nullptr;
++ 
++-    size_t total_bytes = 0;
++     try {
++-        if (host_src_gate && slot.gate_bytes > 0) {
++-            m_queue->memcpy(
++-                (char *)slot.device_ptr + slot.gate_offset,
++-                host_src_gate, slot.gate_bytes).wait();
++-            total_bytes += slot.gate_bytes;
++-        }
++-        if (host_src_up && slot.up_bytes > 0) {
++-            m_queue->memcpy(
++-                (char *)slot.device_ptr + slot.up_offset,
++-                host_src_up, slot.up_bytes).wait();
++-            total_bytes += slot.up_bytes;
++-        }
++-        if (host_src_down && slot.down_bytes > 0) {
++-            m_queue->memcpy(
++-                (char *)slot.device_ptr + slot.down_offset,
++-                host_src_down, slot.down_bytes).wait();
++-            total_bytes += slot.down_bytes;
++-        }
+++        m_queue->memcpy((char *)slot.device_ptr + offset, host_src, bytes).wait();
++     } catch (const sycl::exception & e) {
++-        fprintf(stderr, "moe_cache: promote failed: %s\n", e.what());
+++        fprintf(stderr, "moe_cache: promote_projection failed: %s\n", e.what());
++         return nullptr;
++     }
++ 
++-    m_stats.h2d_bytes += total_bytes;
++-
++-    slot.key = {layer, expert};
++-    slot.occupied = true;
++-    slot.last_access = m_tick;
++-    slot.access_count = 1;
++-
++-    m_layer_index[layer].expert_to_slot[expert] = slot_id;
+++    m_stats.h2d_bytes += bytes;
+++    slot.filled_mask |= bit;
++     m_miss_counts[idx] = 0;
++     m_stats.promotions++;
++ 
++@@ -184,6 +213,8 @@ void moe_expert_cache::reset() {
++         slot.key = {-1, -1};
++         slot.last_access = 0;
++         slot.access_count = 0;
+++        slot.protected_seg = false;
+++        slot.filled_mask = 0;
++     }
++     for (auto & idx : m_layer_index) {
++         std::fill(idx.expert_to_slot.begin(), idx.expert_to_slot.end(), -1);
++@@ -212,11 +243,19 @@ std::string moe_expert_cache::stats_json() const {
++     ss << "\"gpu_expert_calls\":" << m_stats.gpu_expert_calls.load() << ",";
++     ss << "\"cpu_expert_calls\":" << m_stats.cpu_expert_calls.load() << ",";
++     ss << "\"sync_wait_ns\":" << m_stats.sync_wait_ns.load() << ",";
+++    ss << "\"prefill_hits\":" << m_stats.prefill_hits.load() << ",";
+++    ss << "\"prefill_misses\":" << m_stats.prefill_misses.load() << ",";
+++    ss << "\"decode_hits\":" << m_stats.decode_hits.load() << ",";
+++    ss << "\"decode_misses\":" << m_stats.decode_misses.load() << ",";
+++    ss << "\"slru_promotions\":" << m_stats.slru_promotions.load() << ",";
+++    ss << "\"slru_demotions\":" << m_stats.slru_demotions.load() << ",";
++     ss << "\"slot_count\":" << m_slots.size() << ",";
++     ss << "\"slots_used\":" << slots_used() << ",";
++     ss << "\"budget_bytes\":" << m_budget_bytes;
++     uint64_t total = m_stats.hits.load() + m_stats.misses.load();
++     ss << ",\"hit_rate\":" << (total > 0 ? (double)m_stats.hits.load() / total : 0.0);
+++    uint64_t d_total = m_stats.decode_hits.load() + m_stats.decode_misses.load();
+++    ss << ",\"decode_hit_rate\":" << (d_total > 0 ? (double)m_stats.decode_hits.load() / d_total : 0.0);
++     ss << "}";
++     return ss.str();
++ }
++@@ -238,3 +277,70 @@ void moe_expert_cache::touch(int slot_id) {
++     m_slots[slot_id].last_access = m_tick;
++     m_slots[slot_id].access_count++;
++ }
+++
+++int moe_expert_cache::evict_slru() {
+++    // SLRU eviction: try probationary segment first.
+++    // Only evict from protected if probationary is empty.
+++    int victim = -1;
+++    uint64_t oldest = UINT64_MAX;
+++
+++    // First pass: probationary (non-protected) slots.
+++    for (int i = 0; i < (int)m_slots.size(); i++) {
+++        if (m_slots[i].occupied && !m_slots[i].protected_seg &&
+++            m_slots[i].last_access < oldest) {
+++            oldest = m_slots[i].last_access;
+++            victim = i;
+++        }
+++    }
+++    if (victim >= 0) return victim;
+++
+++    // Second pass: protected slots (demote LRU protected to probationary,
+++    // then evict the now-probationary slot).
+++    oldest = UINT64_MAX;
+++    for (int i = 0; i < (int)m_slots.size(); i++) {
+++        if (m_slots[i].occupied && m_slots[i].protected_seg &&
+++            m_slots[i].last_access < oldest) {
+++            oldest = m_slots[i].last_access;
+++            victim = i;
+++        }
+++    }
+++    if (victim >= 0) {
+++        m_slots[victim].protected_seg = false;
+++        m_stats.slru_demotions++;
+++    }
+++    return victim;
+++}
+++
+++void moe_expert_cache::promote_to_protected(int slot_id) {
+++    // Count current protected slots.
+++    int protected_count = 0;
+++    for (const auto & s : m_slots) {
+++        if (s.occupied && s.protected_seg) protected_count++;
+++    }
+++
+++    if (protected_count < m_protected_limit) {
+++        // Room in protected segment -- promote directly.
+++        m_slots[slot_id].protected_seg = true;
+++        m_stats.slru_promotions++;
+++        return;
+++    }
+++
+++    // Protected segment is full: demote LRU protected slot to probationary,
+++    // then promote the new hot slot.
+++    int demote = -1;
+++    uint64_t oldest = UINT64_MAX;
+++    for (int i = 0; i < (int)m_slots.size(); i++) {
+++        if (m_slots[i].occupied && m_slots[i].protected_seg &&
+++            i != slot_id &&
+++            m_slots[i].last_access < oldest) {
+++            oldest = m_slots[i].last_access;
+++            demote = i;
+++        }
+++    }
+++    if (demote >= 0) {
+++        m_slots[demote].protected_seg = false;
+++        m_stats.slru_demotions++;
+++    }
+++    m_slots[slot_id].protected_seg = true;
+++    m_stats.slru_promotions++;
+++}
++diff --git a/ggml/src/ggml-sycl/moe-cache.hpp b/ggml/src/ggml-sycl/moe-cache.hpp
++index 3692625d9..6de7a2821 100644
++--- a/ggml/src/ggml-sycl/moe-cache.hpp
+++++ b/ggml/src/ggml-sycl/moe-cache.hpp
++@@ -5,7 +5,19 @@
++ // layer.  The cache is queried by (layer_id, expert_id) and returns a
++ // device pointer on hit or nullptr on miss.
++ //
++-// Policy: LRU with optional second-miss admission (SLRU in a later milestone).
+++// Policy: SLRU (probationary + protected segments) with second-miss
+++// admission and prefill protection.  Falls back to plain LRU when the
+++// policy is "lru".
+++//
+++// SLRU segments:
+++//   probationary (20%): new entries; one-off experts don't evict hot ones.
+++//   protected (80%): promoted from probationary on second access; only
+++//     evicted when the protected segment is full (demoted to probationary
+++//     rather than freed).
+++//
+++// Prefill protection: during prefill (set_phase(true)), miss counts are
+++// NOT incremented, so long prompts don't flood the cache with one-use
+++// experts.  Decode (set_phase(false)) resumes normal admission.
++ //
++ // Thread safety: the cache is accessed from the SYCL compute thread only;
++ // no concurrent access is expected during a single forward pass.
++@@ -31,10 +43,13 @@ struct moe_expert_key {
++ };
++ 
++ // One cache slot: holds device memory for a single expert's tensors.
+++// Supports partial fill: each projection (gate/up/down) is tracked separately
+++// and the slot is only fully usable once all three are present.
++ struct moe_cache_slot {
++     moe_expert_key key;
++     bool occupied       = false;
++-    bool protected_seg  = false;  // SLRU protected segment (future)
+++    bool protected_seg  = false;  // SLRU protected segment
+++    uint8_t filled_mask = 0;      // bit0=gate, bit1=up, bit2=down
++     uint64_t last_access = 0;
++     uint64_t access_count = 0;
++     void * device_ptr   = nullptr;  // SYCL USM allocation
++@@ -48,6 +63,8 @@ struct moe_cache_slot {
++     size_t gate_bytes   = 0;
++     size_t up_bytes     = 0;
++     size_t down_bytes   = 0;
+++
+++    bool is_full() const { return filled_mask == 0x7; }  // gate+up+down
++ };
++ 
++ // Per-layer index: maps expert_id -> slot_id, or -1 if not cached.
++@@ -69,10 +86,18 @@ struct moe_cache_stats {
++     std::atomic<uint64_t> cpu_expert_calls{0};
++     std::atomic<uint64_t> gpu_expert_calls{0};
++     std::atomic<uint64_t> sync_wait_ns{0};
+++    std::atomic<uint64_t> prefill_misses{0};
+++    std::atomic<uint64_t> decode_misses{0};
+++    std::atomic<uint64_t> prefill_hits{0};
+++    std::atomic<uint64_t> decode_hits{0};
+++    std::atomic<uint64_t> slru_promotions{0};    // probationary -> protected
+++    std::atomic<uint64_t> slru_demotions{0};      // protected -> probationary
++ 
++     void reset() {
++         hits = misses = evictions = promotions = 0;
++         h2d_bytes = cpu_expert_calls = gpu_expert_calls = sync_wait_ns = 0;
+++        prefill_misses = decode_misses = prefill_hits = decode_hits = 0;
+++        slru_promotions = slru_demotions = 0;
++     }
++ };
++ 
++@@ -99,17 +124,24 @@ public:
++ 
++     bool init(const moe_cache_config & cfg, queue_ptr queue);
++ 
++-    // Look up (layer, expert).  Returns slot pointer on hit, nullptr on miss.
++-    void * lookup(int32_t layer, int32_t expert);
+++    // Look up (layer, expert) for a specific projection (0=gate, 1=up, 2=down).
+++    // Returns slot pointer on hit, nullptr on miss.
+++    void * lookup(int32_t layer, int32_t expert, int projection);
++ 
++-    // Record a miss for admission tracking.
+++    // Record a miss for admission tracking.  During prefill, miss counts
+++    // are NOT incremented (prefill protection).
++     void record_miss(int32_t layer, int32_t expert);
++ 
++-    // Promote a missed expert into a cache slot.
++-    void * promote(int32_t layer, int32_t expert,
++-                   const void * host_src_gate,
++-                   const void * host_src_up,
++-                   const void * host_src_down);
+++    // Promote one projection of an expert into the cache.
+++    // If the expert isn't cached yet, allocates a slot and copies this
+++    // projection.  If the expert is cached but this projection is missing,
+++    // fills it.  Returns the slot pointer.
+++    void * promote_projection(int32_t layer, int32_t expert,
+++                               int projection, const void * host_src);
+++
+++    // Set inference phase: true=prefill, false=decode.
+++    // During prefill, miss counts are not incremented.
+++    void set_phase(bool is_prefill) { m_is_prefill = is_prefill; }
++ 
++     void reset();
++ 
++@@ -121,8 +153,10 @@ public:
++     std::string stats_json() const;
++ 
++ private:
++-    int evict_lru();
+++    int  evict_lru();
+++    int  evict_slru();
++     void touch(int slot_id);
+++    void promote_to_protected(int slot_id);
++ 
++     queue_ptr m_queue = nullptr;
++     bool m_initialized = false;
++@@ -131,6 +165,10 @@ private:
++     int m_n_experts = 0;
++     size_t m_expert_bytes = 0;
++     int m_admission_misses = 1;
+++    bool m_prefill_admit = false;
+++    bool m_is_prefill = false;
+++    bool m_use_slru = false;
+++    int m_protected_limit = 0;   // max protected-segment slots
++     uint64_t m_tick = 0;
++ 
++     std::vector<moe_cache_slot> m_slots;
++diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
++index deb8ab59f..650f49856 100644
++--- a/tools/server/server-context.cpp
+++++ b/tools/server/server-context.cpp
++@@ -7,6 +7,7 @@
++ // MoE expert cache stats (defined in ggml-sycl/moe-cache integration).
++ extern std::string moe_cache_collect_stats();
++ extern int moe_cache_reset_all();
+++extern void moe_cache_set_phase_all(bool is_prefill);
++ #include "server-queue.h"
++ #include "server-schema.h"
++ #include "server-stream.h"
++diff --git a/tools/server/server.cpp b/tools/server/server.cpp
++index 2bd396c90..647034104 100644
++--- a/tools/server/server.cpp
+++++ b/tools/server/server.cpp
++@@ -19,7 +19,7 @@
++ #include <thread> // for std::thread::hardware_concurrency
++ 
++ // Forward declaration for MoE cache (defined in ggml-sycl).
++-class moe_expert_cache;
+++struct moe_expert_cache;
++ 
++ #if defined(_WIN32)
++ #include <windows.h>
++-- 
++2.55.0
++
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 650f49856..d7d5de959 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2810,6 +2810,22 @@ private:
+             scoped_timer t(t_pre_decode, n_pre_decode);
+             pre_decode();
+             batch.render();
++
++            // MoE cache phase: if any slot is still processing prompt
++            // tokens (prompt.n_tokens < task.n_tokens), this is a prefill
++            // batch; otherwise all slots are in decode mode.
++            {
++                bool has_prompt = false;
++                for (auto & slot : slots) {
++                    if (slot.is_processing() && slot.task &&
++                        slot.prompt.n_tokens() < slot.task->n_tokens()) {
++                        has_prompt = true;
++                        break;
++                    }
++                }
++                extern void moe_cache_set_phase_all(bool);
++                moe_cache_set_phase_all(has_prompt);
++            }
+         } catch (const std::exception & e) {
+             SRV_ERR("pre_decode() failed: %s\n", e.what());
+             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 647034104..08341fdca 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -102,8 +102,10 @@ int llama_server(int argc, char ** argv) {
+     {
+         extern volatile size_t g_moe_cache_budget_bytes;
+         extern volatile size_t g_moe_cache_admission;
++        extern volatile char   g_moe_cache_policy[];
+         g_moe_cache_budget_bytes = params.moe_cache_bytes;
+         g_moe_cache_admission = params.moe_cache_admission;
++        snprintf((char *)g_moe_cache_policy, 16, "%s", params.moe_cache_policy.c_str());
+         if (params.moe_cache_bytes > 0) {
+             SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
+                     params.moe_cache_bytes, params.moe_cache_policy.c_str(),
 -- 
 2.55.0
 
