@@ -2530,6 +2530,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache-bytes"}, "N",
+        "per-GPU budget in bytes for MoE expert cache (0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_bytes = std::stoull(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-cache-policy"}, "POLICY",
+        "MoE expert cache eviction policy: lru, slru (default: " + params.moe_cache_policy + ")",
+        [](common_params & params, const std::string & value) {
+            if (value != "lru" && value != "slru") {
+                throw std::invalid_argument("invalid policy, expected lru or slru");
+            }
+            params.moe_cache_policy = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-cache-admission-misses"}, "N",
+        "promote expert to cache after N misses (default: " + std::to_string(params.moe_cache_admission) + ")",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("must be >= 1");
+            }
+            params.moe_cache_admission = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-cache-prefill-admission"}, "on|off",
+        "admit experts to cache during prefill (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_prefill = (value == "on");
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

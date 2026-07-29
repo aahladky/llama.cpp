@@ -67,6 +67,20 @@
 #include "ggml-sycl/conv2d-transpose.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+
+#ifdef GGML_MOE_EXPERT_CACHE
+#include "ggml-sycl/moe-cache.hpp"
+#include <cstring>
+// Global budget set by server from --moe-cache-bytes CLI arg.
+// Zero means cache disabled.  Volatile because it's written by the
+// server thread and read by the SYCL compute thread.
+volatile size_t g_moe_cache_budget_bytes = 0;
+volatile size_t g_moe_cache_admission = 1;
+
+// Forward declaration — defined later in this file.
+static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
+                                const ggml_tensor * src0);
+#endif
 #include "ggml-sycl/ssm_scan.hpp"
 #include "ggml-sycl/fill.hpp"
 #include "ggml-sycl/cumsum.hpp"
@@ -4400,6 +4414,79 @@ static void mmid_counting_sort_rows(
     }
 }
 
+#ifdef GGML_MOE_EXPERT_CACHE
+// Parse layer index from tensor name like "blk.5.ffn_gate_exps".
+// Returns -1 if not a MoE expert tensor.
+static int moe_cache_parse_layer(const char * name) {
+    if (!name) return -1;
+    if (strncmp(name, "blk.", 4) != 0) return -1;
+    if (!strstr(name, "exps")) return -1;
+    return atoi(name + 4);
+}
+
+// Derive a cache key that distinguishes gate/up/down tensors.
+// Uses the tensor name hash to avoid collisions when caching
+// different projections of the same expert.
+static int32_t moe_cache_key_offset(const char * name, int n_experts) {
+    if (!name) return 0;
+    // Simple hash of the tensor name suffix (after "blk.N.").
+    const char * dot = strchr(name, '.');
+    if (!dot) return 0;
+    dot = strchr(dot + 1, '.');
+    if (!dot) return 0;
+    dot++; // skip second dot -> "ffn_gate_exps"
+    uint32_t h = 0;
+    for (const char * p = dot; *p; p++) {
+        h = h * 31 + (uint8_t)*p;
+    }
+    // Map to [0, n_experts) range so the combined key stays within bounds.
+    return (int)(h % (uint32_t)n_experts) * n_experts;
+}
+
+// Lazy cache initialization: first call with cache enabled but not yet
+// created.  Uses src0 tensor geometry to size the cache.
+static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
+                                const ggml_tensor * src0) {
+    if (ctx.moe_cache) return;  // already initialized
+
+    int layer = moe_cache_parse_layer(src0->name);
+    if (layer < 0) return;
+
+    // The cache config is stored externally; we need to get it from
+    // the context.  For now, use the tensor geometry directly.
+    // src0 shape: [cols, rows, n_experts]
+    const int64_t n_experts = src0->ne[2];
+    const size_t expert_bytes = src0->nb[2];  // bytes per expert slice
+
+    // Total budget comes from a global set by server.
+    if (g_moe_cache_budget_bytes == 0) return;
+
+    moe_cache_config cfg;
+    cfg.device_id = ctx.device;
+    cfg.budget_bytes = g_moe_cache_budget_bytes;
+    cfg.n_layers = 256;  // generous upper bound; actual layers are sparse
+    cfg.n_experts = (int)n_experts * 3;  // gate * n + up * n + down * n
+    cfg.expert_bytes = expert_bytes;
+    cfg.gate_bytes = expert_bytes;
+    cfg.up_bytes = 0;
+    cfg.down_bytes = 0;
+    cfg.policy = "lru";
+    cfg.admission_misses = 1;
+
+    ctx.moe_cache = new moe_expert_cache();
+    if (ctx.moe_cache->init(cfg, ctx.stream())) {
+        ctx.moe_cache_enabled = true;
+        fprintf(stderr, "moe_cache: initialized on device %d, %d slots, %zu bytes budget\n",
+                ctx.device, ctx.moe_cache->slot_count(),
+                ctx.moe_cache->budget_bytes());
+    } else {
+        fprintf(stderr, "moe_cache: init failed on device %d\n", ctx.device);
+        delete ctx.moe_cache;
+        ctx.moe_cache = nullptr;
+    }
+}
+#endif
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -4414,6 +4501,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
+
+#ifdef GGML_MOE_EXPERT_CACHE
+    // Lazy-initialize the cache on first MoE op.
+    if (g_moe_cache_budget_bytes > 0) {
+        moe_cache_lazy_init(ctx, src0);
+    }
+#endif
 
     if (ne12 == 1) {
         if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
@@ -4464,6 +4558,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
                 const int64_t i1 = id;
                 const int64_t i2 = i12;
+
+#ifdef GGML_MOE_EXPERT_CACHE
+            if (ctx.moe_cache_enabled && ctx.moe_cache) {
+                int layer = moe_cache_parse_layer(src0->name);
+                if (layer >= 0) {
+                    void * cached = ctx.moe_cache->lookup(layer, i02);
+                    if (cached) {
+                        src0_row.data = (char *)cached;
+                        src1_row.data = src1_original + i11*nb11 + i12*nb12;
+                        dst_row.data = dst_original + i1*nb1 + i2*nb2;
+                        ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+                        continue;
+                    }
+                    ctx.moe_cache->record_miss(layer, i02);
+                }
+            }
+#endif
 
             src0_row.data = src0_original + i02*nb02;
             src1_row.data = src1_original + i11*nb11 + i12*nb12;
@@ -4526,6 +4637,36 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
 
             const int64_t expert_row_offset = expert_row_offsets[i02];
+
+#ifdef GGML_MOE_EXPERT_CACHE
+            // Check the expert cache before computing.
+            // On hit, use the cached device pointer directly.
+            // On miss, fall through to the normal compute path.
+            if (ctx.moe_cache_enabled && ctx.moe_cache) {
+                int layer = moe_cache_parse_layer(src0->name);
+                if (layer >= 0) {
+                    void * cached = ctx.moe_cache->lookup(layer, (int)i02);
+                    if (cached) {
+                        // Cache hit: compute using cached expert weights.
+                        src0_row.data = (char *)cached;
+                        src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
+                        src1_row.ne[1] = num_src1_rows;
+                        src1_row.nb[1] = nb11;
+                        src1_row.nb[2] = num_src1_rows*nb11;
+                        src1_row.nb[3] = num_src1_rows*nb11;
+                        dst_row.data = dst_contiguous.get() + expert_row_offset*nb1;
+                        dst_row.ne[1] = num_src1_rows;
+                        dst_row.nb[1] = nb1;
+                        dst_row.nb[2] = num_src1_rows*nb1;
+                        dst_row.nb[3] = num_src1_rows*nb1;
+                        ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+                        continue;
+                    }
+                    // Cache miss: record for admission policy.
+                    ctx.moe_cache->record_miss(layer, (int)i02);
+                }
+            }
+#endif
 
             src0_row.data = src0_original + i02*nb02;
 

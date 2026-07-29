@@ -94,6 +94,20 @@ int llama_server(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    // Pass MoE cache config to the SYCL backend globals.
+    // These symbols live in ggml-sycl; always available when SYCL is linked.
+    {
+        extern volatile size_t g_moe_cache_budget_bytes;
+        extern volatile size_t g_moe_cache_admission;
+        g_moe_cache_budget_bytes = params.moe_cache_bytes;
+        g_moe_cache_admission = params.moe_cache_admission;
+        if (params.moe_cache_bytes > 0) {
+            SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
+                    params.moe_cache_bytes, params.moe_cache_policy.c_str(),
+                    params.moe_cache_admission);
+        }
+    }
+
     common_models_handler models_handler;
     try {
         models_handler = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
