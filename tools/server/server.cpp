@@ -98,18 +98,31 @@ int llama_server(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     // Pass MoE cache config to the SYCL backend globals.
-    // These symbols live in ggml-sycl; always available when SYCL is linked.
+    // These symbols live in ggml-sycl; declared weak so non-SYCL builds
+    // link (they resolve to nullptr there).
     {
-        extern volatile size_t g_moe_cache_budget_bytes;
-        extern volatile size_t g_moe_cache_admission;
-        extern volatile char   g_moe_cache_policy[];
-        g_moe_cache_budget_bytes = params.moe_cache_bytes;
-        g_moe_cache_admission = params.moe_cache_admission;
-        snprintf((char *)g_moe_cache_policy, 16, "%s", params.moe_cache_policy.c_str());
+#if defined(__GNUC__)
+#define MOE_CACHE_WEAK __attribute__((weak))
+#else
+#define MOE_CACHE_WEAK
+#endif
+        extern volatile size_t g_moe_cache_budget_bytes MOE_CACHE_WEAK;
+        extern volatile size_t g_moe_cache_admission MOE_CACHE_WEAK;
+        extern volatile char   g_moe_cache_policy[] MOE_CACHE_WEAK;
+#undef MOE_CACHE_WEAK
+        if (&g_moe_cache_budget_bytes != nullptr) {
+            g_moe_cache_budget_bytes = params.moe_cache_bytes;
+            g_moe_cache_admission = params.moe_cache_admission;
+            snprintf((char *)g_moe_cache_policy, 16, "%s", params.moe_cache_policy.c_str());
+        }
         if (params.moe_cache_bytes > 0) {
-            SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
-                    params.moe_cache_bytes, params.moe_cache_policy.c_str(),
-                    params.moe_cache_admission);
+            if (&g_moe_cache_budget_bytes != nullptr) {
+                SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
+                        params.moe_cache_bytes, params.moe_cache_policy.c_str(),
+                        params.moe_cache_admission);
+            } else {
+                SRV_WRN("%s", "MoE expert cache requested but this build has no SYCL backend\n");
+            }
         }
     }
 

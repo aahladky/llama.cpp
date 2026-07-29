@@ -4,10 +4,19 @@
 #include "server-http.h"
 #include "server-task.h"
 
-// MoE expert cache stats (defined in ggml-sycl/moe-cache integration).
-extern std::string moe_cache_collect_stats();
-extern int moe_cache_reset_all();
-extern void moe_cache_set_phase_all(bool is_prefill);
+// MoE expert cache hooks (defined in ggml-sycl when built with
+// GGML_MOE_EXPERT_CACHE).  Declared weak so that non-SYCL builds link:
+// the symbols resolve to nullptr there and every call site checks them.
+#if defined(__GNUC__)
+#define MOE_CACHE_WEAK __attribute__((weak))
+#else
+#define MOE_CACHE_WEAK
+#endif
+extern std::string moe_cache_collect_stats() MOE_CACHE_WEAK;
+extern int moe_cache_reset_all() MOE_CACHE_WEAK;
+extern void moe_cache_set_phase_all(bool is_prefill) MOE_CACHE_WEAK;
+extern volatile size_t g_moe_cache_budget_bytes MOE_CACHE_WEAK;
+#undef MOE_CACHE_WEAK
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -2814,7 +2823,7 @@ private:
             // MoE cache phase: if any slot is still processing prompt
             // tokens (prompt.n_tokens < task.n_tokens), this is a prefill
             // batch; otherwise all slots are in decode mode.
-            {
+            if (moe_cache_set_phase_all) {
                 bool has_prompt = false;
                 for (auto & slot : slots) {
                     if (slot.is_processing() && slot.task &&
@@ -2823,7 +2832,6 @@ private:
                         break;
                     }
                 }
-                extern void moe_cache_set_phase_all(bool);
                 moe_cache_set_phase_all(has_prompt);
             }
         } catch (const std::exception & e) {
@@ -4487,7 +4495,7 @@ void server_routes::init_routes() {
         }
 
         // MoE expert cache metrics (if cache is active).
-        {
+        if (moe_cache_collect_stats) {
             std::string cache_json_str = moe_cache_collect_stats();
             if (cache_json_str != "[]") {
                 try {
@@ -4551,8 +4559,7 @@ void server_routes::init_routes() {
 
     this->post_cache_reset = [this](const server_http_req &) {
         auto res = create_response();
-        extern volatile size_t g_moe_cache_budget_bytes;
-        if (g_moe_cache_budget_bytes == 0) {
+        if (&g_moe_cache_budget_bytes == nullptr || g_moe_cache_budget_bytes == 0) {
             res->error(format_error_response("MoE cache not enabled", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }

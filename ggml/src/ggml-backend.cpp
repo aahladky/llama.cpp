@@ -1646,13 +1646,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 const uint8_t * src = (const uint8_t *)input->data + eid * expert_size;
                                 uint8_t * dst = (uint8_t *)input_cpy->data + eid * expert_size;
                                 bool from_cache = s_moe_cache_copy(
-                                    split_backend, input->name, eid, src, expert_size, dst);
+                                    split_backend, input->name, eid, (int32_t)n_expert, src, expert_size, dst);
                                 if (!from_cache) {
                                     // Not in cache: copy from host to input_cpy.
                                     // The hook already promoted to cache slot.
+                                    // Only the last expert of the contiguous run
+                                    // needs the padding tail (same as the
+                                    // non-hook path below).
+                                    const size_t copy_bytes = expert_size + (eid == last_id ? padding_end : 0);
                                     ggml_backend_tensor_set_async(split_backend,
                                         input_cpy, src, eid * expert_size,
-                                        expert_size + padding_end);
+                                        copy_bytes);
                                 }
                                 // If from_cache: hook already copied from cache to input_cpy.
                             }

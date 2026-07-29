@@ -2470,11 +2470,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // Detect MoE expert cache support.
             // This fork always includes the cache module when built with SYCL.
             const bool moe_cache = true;
-            // These will be set to true as each sub-feature is implemented.
-            const bool moe_cache_sycl     = false;
-            const bool moe_hybrid_cpu_miss = false;
-            const bool moe_cache_metrics   = false;
-            const bool moe_cache_prefill   = false;
+            // Implemented sub-features (consumed by modelctl via these names):
+            const bool moe_cache_sycl     = true;   // SYCL device slot cache + scheduler hook
+            const bool moe_hybrid_cpu_miss = true;  // CPU-resident experts fall back to H2D copies
+            const bool moe_cache_metrics   = true;  // /metrics + stats JSON
+            const bool moe_cache_prefill   = true;  // prefill/decode phase admission policy
             const bool moe_cache_mmap_adv  = false;
             const bool moe_cache_prefetch  = false;
 

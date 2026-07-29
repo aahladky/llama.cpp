@@ -19,14 +19,16 @@
 // NOT incremented, so long prompts don't flood the cache with one-use
 // experts.  Decode (set_phase(false)) resumes normal admission.
 //
-// Thread safety: the cache is accessed from the SYCL compute thread only;
-// no concurrent access is expected during a single forward pass.
+// Thread safety: the compute path (lookup/record_miss/promote) runs on the
+// SYCL compute thread, while reset/stats/phase can be invoked from the
+// server HTTP threads.  All shared state is protected by m_mutex.
 
 #ifndef GGML_SYCL_MOE_CACHE_HPP
 #define GGML_SYCL_MOE_CACHE_HPP
 
 #include <cstdint>
 #include <atomic>
+#include <mutex>
 #include <vector>
 #include <string>
 #include "common.hpp"
@@ -85,7 +87,6 @@ struct moe_cache_stats {
     std::atomic<uint64_t> h2d_bytes{0};
     std::atomic<uint64_t> cpu_expert_calls{0};
     std::atomic<uint64_t> gpu_expert_calls{0};
-    std::atomic<uint64_t> sync_wait_ns{0};
     std::atomic<uint64_t> prefill_misses{0};
     std::atomic<uint64_t> decode_misses{0};
     std::atomic<uint64_t> prefill_hits{0};
@@ -95,7 +96,7 @@ struct moe_cache_stats {
 
     void reset() {
         hits = misses = evictions = promotions = 0;
-        h2d_bytes = cpu_expert_calls = gpu_expert_calls = sync_wait_ns = 0;
+        h2d_bytes = cpu_expert_calls = gpu_expert_calls = 0;
         prefill_misses = decode_misses = prefill_hits = decode_hits = 0;
         slru_promotions = slru_demotions = 0;
     }
@@ -125,8 +126,10 @@ public:
     bool init(const moe_cache_config & cfg, queue_ptr queue);
 
     // Look up (layer, expert) for a specific projection (0=gate, 1=up, 2=down).
-    // Returns slot pointer on hit, nullptr on miss.
-    void * lookup(int32_t layer, int32_t expert, int projection);
+    // proj_bytes must match the init-time projection size, otherwise the
+    // request is treated as not cacheable.  Returns a device pointer to the
+    // projection region within the slot on hit, nullptr on miss.
+    void * lookup(int32_t layer, int32_t expert, int projection, size_t proj_bytes);
 
     // Record a miss for admission tracking.  During prefill, miss counts
     // are NOT incremented (prefill protection).
@@ -135,13 +138,18 @@ public:
     // Promote one projection of an expert into the cache.
     // If the expert isn't cached yet, allocates a slot and copies this
     // projection.  If the expert is cached but this projection is missing,
-    // fills it.  Returns the slot pointer.
+    // fills it.  proj_bytes must match the init-time projection size,
+    // otherwise no copy is made.  Returns a device pointer to the
+    // projection region within the slot.
     void * promote_projection(int32_t layer, int32_t expert,
-                               int projection, const void * host_src);
+                               int projection, const void * host_src, size_t proj_bytes);
+
+    // Count one expert served from host memory (cache fallback).
+    void inc_cpu_expert_calls() { m_stats.cpu_expert_calls++; }
 
     // Set inference phase: true=prefill, false=decode.
     // During prefill, miss counts are not incremented.
-    void set_phase(bool is_prefill) { m_is_prefill = is_prefill; }
+    void set_phase(bool is_prefill);
 
     void reset();
 
@@ -164,6 +172,9 @@ private:
     int m_n_layers = 0;
     int m_n_experts = 0;
     size_t m_expert_bytes = 0;
+    size_t m_gate_bytes = 0;
+    size_t m_up_bytes   = 0;
+    size_t m_down_bytes = 0;
     int m_admission_misses = 1;
     bool m_prefill_admit = false;
     bool m_is_prefill = false;
@@ -171,6 +182,7 @@ private:
     int m_protected_limit = 0;   // max protected-segment slots
     uint64_t m_tick = 0;
 
+    mutable std::mutex m_mutex;  // protects slots, layer index, miss counts, phase
     std::vector<moe_cache_slot> m_slots;
     std::vector<moe_cache_layer_index> m_layer_index;
     std::vector<int> m_miss_counts;

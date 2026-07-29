@@ -355,7 +355,8 @@ extern "C" {
     // expert from host to device.  Returns true if the expert was copied
     // from the cache, false if it should be copied from host.
     typedef bool (*ggml_backend_sched_moe_cache_fn)(ggml_backend_t backend, const char * tensor_name,
-                                                      int32_t expert_id, const uint8_t * host_src,
+                                                      int32_t expert_id, int32_t n_experts,
+                                                      const uint8_t * host_src,
                                                       size_t expert_bytes, uint8_t * dst);
     GGML_API void ggml_backend_sched_set_moe_cache_hook(ggml_backend_sched_moe_cache_fn fn);
 

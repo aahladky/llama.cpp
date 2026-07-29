@@ -80,10 +80,6 @@ volatile char   g_moe_cache_policy[16] = "lru";
 // Populated during lazy_init so the metrics endpoint can read stats
 // without needing access to the SYCL backend context.
 moe_expert_cache * g_moe_cache_instances[GGML_SYCL_MAX_DEVICES] = {nullptr};
-
-// Forward declaration — defined later in this file.
-static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
-                                const ggml_tensor * src0);
 #endif
 #include "ggml-sycl/ssm_scan.hpp"
 #include "ggml-sycl/fill.hpp"
@@ -4437,22 +4433,18 @@ static int moe_cache_parse_projection(const char * name) {
     return -1;
 }
 
-// Derive projection from tensor name.
-
-// Lazy cache initialization: first call with cache enabled but not yet
-// created.  Uses src0 tensor geometry to size the cache.
+// Lazy cache initialization: called from the scheduler hook on the first
+// cache-eligible expert copy.  The hook receives the original host tensor
+// name ("blk.N.ffn_*_exps"), so this fires even when ALL MoE layers are
+// CPU-resident and the SYCL graph never sees the weight tensors directly.
+// Runs on the compute thread only, so no extra synchronization is needed.
 static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
-                                const ggml_tensor * src0) {
-    if (ctx.moe_cache) return;  // already initialized
+                                const char * tensor_name,
+                                int32_t n_experts, size_t expert_bytes) {
+    if (ctx.moe_cache || ctx.moe_cache_init_failed) return;  // already handled
 
-    int layer = moe_cache_parse_layer(src0->name);
+    int layer = moe_cache_parse_layer(tensor_name);
     if (layer < 0) return;
-
-    // The cache config is stored externally; we need to get it from
-    // the context.  For now, use the tensor geometry directly.
-    // src0 shape: [cols, rows, n_experts]
-    const int64_t n_experts = src0->ne[2];
-    const size_t expert_bytes = src0->nb[2];  // bytes per expert slice
 
     // Total budget comes from a global set by server.
     if (g_moe_cache_budget_bytes == 0) return;
@@ -4461,10 +4453,11 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     cfg.device_id = ctx.device;
     cfg.budget_bytes = g_moe_cache_budget_bytes;
     cfg.n_layers = 256;  // generous upper bound; actual layers are sparse
-    cfg.n_experts = (int)n_experts;  // per-projection expert count
+    cfg.n_experts = n_experts;  // per-projection expert count
     // Slot must hold all three projections (gate+up+down).
-    // All three are typically the same size; capture each from its own
-    // tensor's nb[2] when promoted.  For now, estimate as 3x one projection.
+    // All three are typically the same size; projections whose actual size
+    // differs from the init-time size are rejected by the geometry guards
+    // in lookup/promote_projection and simply never cached.
     cfg.expert_bytes = expert_bytes * 3;
     cfg.gate_bytes = expert_bytes;
     cfg.up_bytes = expert_bytes;
@@ -4483,6 +4476,7 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
         fprintf(stderr, "moe_cache: init failed on device %d\n", ctx.device);
         delete ctx.moe_cache;
         ctx.moe_cache = nullptr;
+        ctx.moe_cache_init_failed = true;
     }
 }
 
@@ -4491,44 +4485,59 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
 // from cache slot to dst (GPU-to-GPU).  On miss, promotes to cache slot
 // and copies from cache slot to dst.  Returns true if copied from cache.
 static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name,
-                                 int32_t expert_id, const uint8_t * host_src,
+                                 int32_t expert_id, int32_t n_experts,
+                                 const uint8_t * host_src,
                                  size_t expert_bytes, uint8_t * dst) {
+    // The hook is registered globally; only handle SYCL backends so the
+    // context cast below is safe in mixed-backend builds.
+    if (!ggml_backend_is_sycl(backend)) return false;
+
     ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backend->context;
+
+    if (!ctx->moe_cache) {
+        moe_cache_lazy_init(*ctx, tensor_name, n_experts, expert_bytes);
+    }
     if (!ctx->moe_cache_enabled || !ctx->moe_cache) return false;
 
     int layer = moe_cache_parse_layer(tensor_name);
     int proj  = moe_cache_parse_projection(tensor_name);
     if (layer < 0 || proj < 0) return false;
 
+    // MMQ kernels can read a few bytes past the end of the expert weights;
+    // copy the padding tail from host (as the non-cache path in
+    // ggml-backend.cpp does) so there are no NaNs in the padding.
+    const size_t padding = expert_id < n_experts - 1
+                         ? std::min(expert_bytes, (size_t)512) : 0;
+
     // Check cache for this expert+projection.
-    void * cached = ctx->moe_cache->lookup(layer, expert_id, proj);
+    void * cached = ctx->moe_cache->lookup(layer, expert_id, proj, expert_bytes);
     if (cached) {
         // Cache hit: copy from cache slot to dst (GPU-to-GPU).
         // dst is input_cpy->data + eid * expert_size.
         // The compute kernel will read from input_cpy as usual.
         ctx->stream()->memcpy(dst, cached, expert_bytes);
+        if (padding > 0) {
+            ctx->stream()->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
+        }
         return true;
     }
 
     // Cache miss: promote to cache slot, then copy from cache slot to dst.
     ctx->moe_cache->record_miss(layer, expert_id);
-    void * slot = ctx->moe_cache->promote_projection(layer, expert_id, proj, host_src);
+    void * slot = ctx->moe_cache->promote_projection(layer, expert_id, proj,
+                                                      host_src, expert_bytes);
     if (slot) {
         ctx->stream()->memcpy(dst, slot, expert_bytes);
+        if (padding > 0) {
+            ctx->stream()->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
+        }
         return true;
     }
 
     // Promotion failed (cache full or below admission threshold):
     // fall through to normal host-to-device copy.
+    ctx->moe_cache->inc_cpu_expert_calls();
     return false;
-}
-
-// Register the hook with the scheduler.
-void ggml_backend_sycl_register_cache_hook(ggml_backend_t backend) {
-    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backend->context;
-    if (ctx->moe_cache_enabled && ctx->moe_cache) {
-        ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
-    }
 }
 
 // Collect cache stats from all initialized caches.
@@ -4590,27 +4599,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-#ifdef GGML_MOE_EXPERT_CACHE
-    // Lazy-initialize the cache on first MoE op.
-    if (g_moe_cache_budget_bytes > 0) {
-        moe_cache_lazy_init(ctx, src0);
-    }
-#endif
-
     if (ne12 == 1) {
-#ifdef GGML_MOE_EXPERT_CACHE
-        // When the cache is enabled, skip the fused path entirely so the
-        // normal loop can consult the cache per expert.  The fused kernel
-        // uses original weights, not cached pointers -- gating it is the
-        // only way to get cache hits on the decode path (F3 in review).
-        if (!(ctx.moe_cache_enabled && ctx.moe_cache)) {
-#endif
-            if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
-                return;
-            }
-#ifdef GGML_MOE_EXPERT_CACHE
+        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+            return;
         }
-#endif
     }
 
     std::vector<char> ids_host(ggml_nbytes(ids));
@@ -4656,27 +4648,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
                 const int64_t i1 = id;
                 const int64_t i2 = i12;
-
-#ifdef GGML_MOE_EXPERT_CACHE
-            if (ctx.moe_cache_enabled && ctx.moe_cache) {
-                int layer = moe_cache_parse_layer(src0->name);
-                int proj  = moe_cache_parse_projection(src0->name);
-                if (layer >= 0 && proj >= 0) {
-                    void * cached = ctx.moe_cache->lookup(layer, i02, proj);
-                    if (cached) {
-                        src0_row.data = (char *)cached;
-                        src1_row.data = src1_original + i11*nb11 + i12*nb12;
-                        dst_row.data = dst_original + i1*nb1 + i2*nb2;
-                        ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
-                        continue;
-                    }
-                    ctx.moe_cache->record_miss(layer, i02);
-                    // Try to promote this projection after the miss.
-                    ctx.moe_cache->promote_projection(layer, i02, proj,
-                                                       src0_original + i02*nb02);
-                }
-            }
-#endif
 
             src0_row.data = src0_original + i02*nb02;
             src1_row.data = src1_original + i11*nb11 + i12*nb12;
@@ -4739,40 +4710,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
 
             const int64_t expert_row_offset = expert_row_offsets[i02];
-
-#ifdef GGML_MOE_EXPERT_CACHE
-            // Check the expert cache before computing.
-            // On hit, use the cached device pointer directly.
-            // On miss, fall through to the normal compute path.
-            if (ctx.moe_cache_enabled && ctx.moe_cache) {
-                int layer = moe_cache_parse_layer(src0->name);
-                int proj  = moe_cache_parse_projection(src0->name);
-                if (layer >= 0 && proj >= 0) {
-                    void * cached = ctx.moe_cache->lookup(layer, (int)i02, proj);
-                    if (cached) {
-                        // Cache hit: compute using cached expert weights.
-                        src0_row.data = (char *)cached;
-                        src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
-                        src1_row.ne[1] = num_src1_rows;
-                        src1_row.nb[1] = nb11;
-                        src1_row.nb[2] = num_src1_rows*nb11;
-                        src1_row.nb[3] = num_src1_rows*nb11;
-                        dst_row.data = dst_contiguous.get() + expert_row_offset*nb1;
-                        dst_row.ne[1] = num_src1_rows;
-                        dst_row.nb[1] = nb1;
-                        dst_row.nb[2] = num_src1_rows*nb1;
-                        dst_row.nb[3] = num_src1_rows*nb1;
-                        ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
-                        continue;
-                    }
-                    // Cache miss: record for admission policy.
-                    ctx.moe_cache->record_miss(layer, (int)i02);
-                    // Try to promote this projection after the miss.
-                    ctx.moe_cache->promote_projection(layer, (int)i02, proj,
-                                                       src0_original + i02*nb02);
-                }
-            }
-#endif
 
             src0_row.data = src0_original + i02*nb02;
 
@@ -5286,6 +5223,16 @@ static const char * ggml_backend_sycl_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_sycl_free(ggml_backend_t backend) {
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+
+#ifdef GGML_MOE_EXPERT_CACHE
+    // Free the MoE expert cache and clear its registry entry so the metrics
+    // endpoint stops reporting this device.
+    if (sycl_ctx->moe_cache) {
+        g_moe_cache_instances[sycl_ctx->device] = nullptr;
+        delete sycl_ctx->moe_cache;
+        sycl_ctx->moe_cache = nullptr;
+    }
+#endif
 
     delete sycl_ctx;
     delete backend;
@@ -6452,8 +6399,13 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
 
 #ifdef GGML_MOE_EXPERT_CACHE
     // Register the cache hook with the scheduler so it checks the cache
-    // before copying experts from host to device.
-    ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
+    // before copying experts from host to device.  Only register when a
+    // cache budget was configured (the server sets the globals from CLI
+    // args before backend init); with a zero budget the per-expert hook
+    // loop would be pure overhead.
+    if (g_moe_cache_budget_bytes > 0) {
+        ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
+    }
 #endif
 
     return sycl_backend;

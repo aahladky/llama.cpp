@@ -480,6 +480,7 @@ struct ggml_backend_sycl_context {
     // One cache per device context; initialized lazily on first use.
     struct moe_expert_cache * moe_cache = nullptr;
     bool moe_cache_enabled = false;
+    bool moe_cache_init_failed = false;  // don't retry lazy init after failure
 #endif
 };
 

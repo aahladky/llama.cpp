@@ -30,6 +30,9 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
     m_n_layers     = cfg.n_layers;
     m_n_experts    = cfg.n_experts;
     m_expert_bytes = cfg.expert_bytes;
+    m_gate_bytes   = cfg.gate_bytes;
+    m_up_bytes     = cfg.up_bytes;
+    m_down_bytes   = cfg.down_bytes;
     m_admission_misses = std::max(1, cfg.admission_misses);
     m_prefill_admit   = cfg.prefill_admit;
     m_is_prefill      = false;
@@ -79,10 +82,23 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
     return true;
 }
 
-void * moe_expert_cache::lookup(int32_t layer, int32_t expert, int projection) {
+void * moe_expert_cache::lookup(int32_t layer, int32_t expert, int projection,
+                                size_t proj_bytes) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
     if (!m_initialized || layer < 0 || layer >= m_n_layers ||
         expert < 0 || expert >= m_n_experts) {
         m_stats.misses++;
+        return nullptr;
+    }
+
+    // Geometry guard: only serve from cache when the caller's projection
+    // size matches the init-time size (otherwise the slot region would be
+    // over-read).  Not counted as a miss -- this expert is not cacheable.
+    const size_t expect = projection == 0 ? m_gate_bytes :
+                          projection == 1 ? m_up_bytes   :
+                          projection == 2 ? m_down_bytes : 0;
+    if (expect == 0 || expect != proj_bytes) {
         return nullptr;
     }
 
@@ -95,10 +111,11 @@ void * moe_expert_cache::lookup(int32_t layer, int32_t expert, int projection) {
         // Check that the requested projection is filled.
         const moe_cache_slot & s = m_slots[slot_id];
         bool filled = false;
+        size_t offset = 0;
         switch (projection) {
-            case 0: filled = (s.filled_mask & 1) != 0; break;  // gate
-            case 1: filled = (s.filled_mask & 2) != 0; break;  // up
-            case 2: filled = (s.filled_mask & 4) != 0; break;  // down
+            case 0: filled = (s.filled_mask & 1) != 0; offset = s.gate_offset; break;  // gate
+            case 1: filled = (s.filled_mask & 2) != 0; offset = s.up_offset;   break;  // up
+            case 2: filled = (s.filled_mask & 4) != 0; offset = s.down_offset; break;  // down
         }
         if (!filled) {
             m_stats.misses++;
@@ -118,7 +135,8 @@ void * moe_expert_cache::lookup(int32_t layer, int32_t expert, int projection) {
             m_slots[slot_id].access_count >= 2) {
             promote_to_protected(slot_id);
         }
-        return m_slots[slot_id].device_ptr;
+        // Return the projection region within the slot, not the slot base.
+        return (char *)m_slots[slot_id].device_ptr + offset;
     }
 
     m_stats.misses++;
@@ -128,6 +146,8 @@ void * moe_expert_cache::lookup(int32_t layer, int32_t expert, int projection) {
 }
 
 void moe_expert_cache::record_miss(int32_t layer, int32_t expert) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
     if (!m_initialized || layer < 0 || layer >= m_n_layers ||
         expert < 0 || expert >= m_n_experts) {
         return;
@@ -141,9 +161,20 @@ void moe_expert_cache::record_miss(int32_t layer, int32_t expert) {
 }
 
 void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
-                                             int projection, const void * host_src) {
+                                             int projection, const void * host_src,
+                                             size_t proj_bytes) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
     if (!m_initialized || !host_src) return nullptr;
     if (layer < 0 || layer >= m_n_layers || expert < 0 || expert >= m_n_experts) return nullptr;
+
+    // Geometry guard: bail out of caching when the caller's projection size
+    // does not match the init-time size (avoids over-reading host_src or
+    // overflowing the slot region).
+    const size_t expect = projection == 0 ? m_gate_bytes :
+                          projection == 1 ? m_up_bytes   :
+                          projection == 2 ? m_down_bytes : 0;
+    if (expect == 0 || expect != proj_bytes) return nullptr;
 
     int idx = layer * m_n_experts + expert;
     if (m_miss_counts[idx] < m_admission_misses) {
@@ -210,10 +241,18 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
     m_miss_counts[idx] = 0;
     m_stats.promotions++;
 
-    return slot.device_ptr;
+    // Return the projection region within the slot, not the slot base.
+    return (char *)slot.device_ptr + offset;
+}
+
+void moe_expert_cache::set_phase(bool is_prefill) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_is_prefill = is_prefill;
 }
 
 void moe_expert_cache::reset() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
     for (auto & slot : m_slots) {
         slot.occupied = false;
         slot.key = {-1, -1};
@@ -231,6 +270,8 @@ void moe_expert_cache::reset() {
 }
 
 int moe_expert_cache::slots_used() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
     int count = 0;
     for (const auto & s : m_slots) {
         if (s.occupied) count++;
@@ -239,6 +280,13 @@ int moe_expert_cache::slots_used() const {
 }
 
 std::string moe_expert_cache::stats_json() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    int used = 0;
+    for (const auto & s : m_slots) {
+        if (s.occupied) used++;
+    }
+
     std::ostringstream ss;
     ss << "{";
     ss << "\"hits\":" << m_stats.hits.load() << ",";
@@ -248,7 +296,6 @@ std::string moe_expert_cache::stats_json() const {
     ss << "\"h2d_bytes\":" << m_stats.h2d_bytes.load() << ",";
     ss << "\"gpu_expert_calls\":" << m_stats.gpu_expert_calls.load() << ",";
     ss << "\"cpu_expert_calls\":" << m_stats.cpu_expert_calls.load() << ",";
-    ss << "\"sync_wait_ns\":" << m_stats.sync_wait_ns.load() << ",";
     ss << "\"prefill_hits\":" << m_stats.prefill_hits.load() << ",";
     ss << "\"prefill_misses\":" << m_stats.prefill_misses.load() << ",";
     ss << "\"decode_hits\":" << m_stats.decode_hits.load() << ",";
@@ -256,7 +303,7 @@ std::string moe_expert_cache::stats_json() const {
     ss << "\"slru_promotions\":" << m_stats.slru_promotions.load() << ",";
     ss << "\"slru_demotions\":" << m_stats.slru_demotions.load() << ",";
     ss << "\"slot_count\":" << m_slots.size() << ",";
-    ss << "\"slots_used\":" << slots_used() << ",";
+    ss << "\"slots_used\":" << used << ",";
     ss << "\"budget_bytes\":" << m_budget_bytes;
     uint64_t total = m_stats.hits.load() + m_stats.misses.load();
     ss << ",\"hit_rate\":" << (total > 0 ? (double)m_stats.hits.load() / total : 0.0);
