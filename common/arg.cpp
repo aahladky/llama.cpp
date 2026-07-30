@@ -2637,18 +2637,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             devices_json += "]";
 
-            // Detect MoE expert cache support.
-            // This fork always includes the cache module when built with SYCL.
-            const bool has_sycl = !sycl_devices.empty();
+            // Detect MoE expert cache support truthfully: query whether any
+            // registered backend actually implements the cache's versioned
+            // procs, rather than assuming "a SYCL device is registered"
+            // implies "the cache feature is compiled into this build."
+            // Those are NOT the same thing -- a SYCL build compiled without
+            // GGML_MOE_EXPERT_CACHE (or, in principle, a future backend
+            // other than SYCL implementing this feature) would have SYCL
+            // devices but no cache, or vice versa. This also works
+            // correctly for GGML_BACKEND_DL=ON: proc-address lookup goes
+            // through the same backend-registry mechanism regardless of
+            // whether the implementing backend was linked statically or
+            // loaded from a plugin .so.
+            bool cache_implemented = false;
+            std::string cache_backend_name;
+            for (size_t i = 0; i < ggml_backend_reg_count() && !cache_implemented; ++i) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+                if (ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_cache_configure_v1")) {
+                    cache_implemented = true;
+                    cache_backend_name = ggml_backend_reg_name(reg);
+                }
+            }
             // Implemented sub-features (consumed by modelctl via these names):
-            const bool moe_weight_transfer_cache = has_sycl;  // SYCL device slot cache + scheduler hook
-            const bool moe_hybrid_cpu_miss       = false;     // NOT IMPLEMENTED: CPU-miss execution does not
-                                                              // exist; misses fall back to the GPU path.
-                                                              // (moe-hybrid.cpp holds unreferenced stubs for
-                                                              // a future phase.)
-            const bool moe_cache_metrics         = has_sycl;  // /metrics + stats JSON
-            const bool moe_cache_prefill_policy  = has_sycl;  // prefill/decode phase admission policy
-            const bool moe_cache_reset           = has_sycl;  // cache reset via API
+            const bool moe_weight_transfer_cache = cache_implemented;  // device slot cache + scheduler hook
+            const bool moe_hybrid_cpu_miss        = false;  // NOT IMPLEMENTED: CPU-miss execution does not
+                                                             // exist; misses fall back to the GPU path.
+                                                             // (moe-hybrid.cpp holds unreferenced stubs for
+                                                             // a future phase.)
+            const bool moe_cache_metrics         = cache_implemented;  // /metrics + stats JSON
+            const bool moe_cache_prefill_policy  = cache_implemented;  // prefill/decode phase admission policy
+            const bool moe_cache_reset           = cache_implemented;  // cache reset via API
             const bool moe_cache_prefetch        = false;     // NOT IMPLEMENTED: expert prefetch (Phase 9)
 
             printf("{\n");
@@ -2678,7 +2696,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             printf("  },\n");
             // Constraints
             printf("  \"constraints\": {\n");
-            printf("    \"moe_cache_backend\": \"%s\",\n", has_sycl ? "SYCL" : "");
+            printf("    \"moe_cache_backend\": \"%s\",\n", cache_implemented ? cache_backend_name.c_str() : "");
             printf("    \"moe_cache_min_batch\": 32,\n");
             printf("    \"moe_cache_supported_projections\": [\"gate\", \"up\", \"down\"],\n");
             // Hybrid constraints: hybrid CPU-miss execution is not implemented,
@@ -2766,16 +2784,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-hybrid-mode"}, "on|off",
         "enable hybrid GPU-hit/CPU-miss MoE execution (default: off)",
         [](common_params & params, const std::string & value) {
-            if (value == "on") {
-#if defined(__GNUC__)
-                extern volatile int g_moe_hybrid_mode __attribute__((weak));
-#else
-                extern volatile int g_moe_hybrid_mode;
-#endif
-                if (&g_moe_hybrid_mode != nullptr) {
-                    g_moe_hybrid_mode = 1;
-                }
-            }
+            // Only record the parsed intent here -- backends aren't
+            // guaranteed to be loaded yet at arg-parse time, and even once
+            // loaded, writing to the implementing backend goes through the
+            // registry proc-address lookup (tools/server/moe-cache-iface.h),
+            // not a direct global write, so it works correctly for both
+            // static and GGML_BACKEND_DL=ON builds.
+            params.moe_hybrid_mode = (value == "on");
         }
     ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0

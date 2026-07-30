@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "moe-cache-iface.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -142,27 +143,26 @@ int llama_server(common_params & params, int argc, char ** argv) {
     common_params_print_info(params, !is_router_server);
 
     if (!is_router_server) {
-        // Pass MoE cache config to the SYCL backend globals.
-        // These symbols live in ggml-sycl; declared weak so non-SYCL builds
-        // link (they resolve to nullptr there). Skipped for router-mode
-        // instances, which never load a model or touch the GPU.
+        // Pass MoE cache config to whichever backend implements it (see
+        // moe-cache-iface.h for why this goes through the backend-registry
+        // proc-address mechanism rather than writing globals directly).
+        // Skipped for router-mode instances, which never load a model or
+        // touch the GPU.
         {
-#if defined(__GNUC__)
-#define MOE_CACHE_WEAK __attribute__((weak))
-#else
-#define MOE_CACHE_WEAK
-#endif
-            extern volatile size_t g_moe_cache_budget_bytes MOE_CACHE_WEAK;
-            extern volatile size_t g_moe_cache_admission MOE_CACHE_WEAK;
-            extern volatile char   g_moe_cache_policy[] MOE_CACHE_WEAK;
-#undef MOE_CACHE_WEAK
-            if (&g_moe_cache_budget_bytes != nullptr) {
-                g_moe_cache_budget_bytes = params.moe_cache_bytes;
-                g_moe_cache_admission = params.moe_cache_admission;
-                snprintf((char *)g_moe_cache_policy, 16, "%s", params.moe_cache_policy.c_str());
+            const moe_cache_procs & procs = moe_cache_get_procs();
+            if (procs.available()) {
+                ggml_backend_moe_cache_config cfg;
+                cfg.budget_bytes     = params.moe_cache_bytes;
+                cfg.admission_misses = params.moe_cache_admission;
+                cfg.policy           = params.moe_cache_policy.c_str();
+                cfg.prefill_admit    = params.moe_cache_prefill;
+                procs.configure(&cfg);
+                if (procs.hybrid_set_mode) {
+                    procs.hybrid_set_mode(params.moe_hybrid_mode ? 1 : 0);
+                }
             }
             if (params.moe_cache_bytes > 0) {
-                if (&g_moe_cache_budget_bytes != nullptr) {
+                if (procs.available()) {
                     SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
                             params.moe_cache_bytes, params.moe_cache_policy.c_str(),
                             params.moe_cache_admission);

@@ -487,6 +487,7 @@ struct common_params {
     std::string moe_cache_policy = "lru";  // "lru" or "slru"
     int moe_cache_admission   = 2;         // promote after N misses (default 2 per plan)
     bool moe_cache_prefill    = false;     // admit experts during prefill
+    bool moe_hybrid_mode      = false;     // enable hybrid GPU-hit/CPU-miss MoE execution
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
