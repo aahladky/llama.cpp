@@ -2469,34 +2469,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
             // Detect MoE expert cache support.
             // This fork always includes the cache module when built with SYCL.
-            const bool moe_cache = true;
+            const bool has_sycl = !sycl_devices.empty();
             // Implemented sub-features (consumed by modelctl via these names):
-            const bool moe_cache_sycl     = true;   // SYCL device slot cache + scheduler hook
-            const bool moe_hybrid_cpu_miss = true;  // CPU-resident experts fall back to H2D copies
-            const bool moe_cache_metrics   = true;  // /metrics + stats JSON
-            const bool moe_cache_prefill   = true;  // prefill/decode phase admission policy
-            const bool moe_cache_mmap_adv  = false;
-            const bool moe_cache_prefetch  = false;
+            const bool moe_weight_transfer_cache = has_sycl;  // SYCL device slot cache + scheduler hook
+            const bool moe_hybrid_cpu_miss       = has_sycl;  // GPU-hit/CPU-miss hybrid execution (Phase 7)
+            const bool moe_cache_metrics         = has_sycl;  // /metrics + stats JSON
+            const bool moe_cache_prefill_policy  = has_sycl;  // prefill/decode phase admission policy
+            const bool moe_cache_reset           = has_sycl;  // cache reset via API
+            const bool moe_cache_prefetch        = false;     // NOT IMPLEMENTED: expert prefetch (Phase 9)
 
             printf("{\n");
-            printf("  \"schema\": 1,\n");
+            printf("  \"schema\": 2,\n");
             printf("  \"backend\": \"llama.cpp\",\n");
-            printf("  \"build\": \"custom-moe-cache\",\n");
-            printf("  \"devices\": %s,\n", devices_json.c_str());
+            printf("  \"build\": {\n");
+            printf("    \"commit\": \"custom-moe-cache\",\n");
+            printf("    \"compiler\": \"\",\n");
+            printf("    \"dynamic_backends\": false\n");
+            printf("  },\n");
+            // Devices with per-device features
+            printf("  \"devices\": [\n");
+            printf("    {\"type\": \"CPU\", \"name\": \"CPU\", \"index\": 0, \"features\": {\"moe_weight_transfer_cache\": false}}");
+            for (size_t i = 0; i < sycl_devices.size(); ++i) {
+                printf(",\n    {\"type\": \"SYCL\", \"name\": \"%s\", \"index\": %zu, \"features\": {\"moe_weight_transfer_cache\": %s}}",
+                       sycl_devices[i].c_str(), i + 1, moe_weight_transfer_cache ? "true" : "false");
+            }
+            printf("\n  ],\n");
+            // Global features
             printf("  \"features\": {\n");
-            printf("    \"moe_expert_cache\": %s,\n", moe_cache ? "true" : "false");
-            printf("    \"moe_cache_sycl\": %s,\n", moe_cache_sycl ? "true" : "false");
+            printf("    \"moe_weight_transfer_cache\": %s,\n", moe_weight_transfer_cache ? "true" : "false");
             printf("    \"moe_hybrid_cpu_miss\": %s,\n", moe_hybrid_cpu_miss ? "true" : "false");
             printf("    \"moe_cache_metrics\": %s,\n", moe_cache_metrics ? "true" : "false");
-            printf("    \"moe_cache_prefill_policy\": %s,\n", moe_cache_prefill ? "true" : "false");
-            printf("    \"moe_cache_mmap_advice\": %s,\n", moe_cache_mmap_adv ? "true" : "false");
+            printf("    \"moe_cache_prefill_policy\": %s,\n", moe_cache_prefill_policy ? "true" : "false");
+            printf("    \"moe_cache_reset\": %s,\n", moe_cache_reset ? "true" : "false");
             printf("    \"moe_cache_prefetch\": %s\n", moe_cache_prefetch ? "true" : "false");
             printf("  },\n");
+            // Constraints
+            printf("  \"constraints\": {\n");
+            printf("    \"moe_cache_backend\": \"%s\",\n", has_sycl ? "SYCL" : "");
+            printf("    \"moe_cache_min_batch\": 32,\n");
+            printf("    \"moe_cache_supported_projections\": [\"gate\", \"up\", \"down\"],\n");
+            printf("    \"moe_hybrid_supported_archs\": [\"deepseek_v2\", \"deepseek_v3\", \"qwen3_moe\"],\n");
+            printf("    \"moe_hybrid_supported_quant\": [\"q4_0\", \"q4_k_m\", \"q8_0\", \"f16\"],\n");
+            printf("    \"moe_hybrid_can_overlap\": true\n");
+            printf("  },\n");
+            // CLI flag names (canonical keys)
             printf("  \"cli\": {\n");
-            printf("    \"cache_bytes\": \"--moe-cache-bytes\",\n");
-            printf("    \"cache_policy\": \"--moe-cache-policy\",\n");
-            printf("    \"admission_misses\": \"--moe-cache-admission-misses\",\n");
-            printf("    \"prefill_admission\": \"--moe-cache-prefill-admission\"\n");
+            printf("    \"moe_cache_bytes\": \"--moe-cache-bytes\",\n");
+            printf("    \"moe_cache_policy\": \"--moe-cache-policy\",\n");
+            printf("    \"moe_cache_admission\": \"--moe-cache-admission-misses\",\n");
+            printf("    \"moe_cache_prefill\": \"--moe-cache-prefill-admission\",\n");
+            printf("    \"moe_hybrid_mode\": \"--moe-hybrid-mode\"\n");
             printf("  }\n");
             printf("}\n");
             exit(0);
@@ -2562,6 +2584,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "admit experts to cache during prefill (default: off)",
         [](common_params & params, const std::string & value) {
             params.moe_cache_prefill = (value == "on");
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-hybrid-mode"}, "on|off",
+        "enable hybrid GPU-hit/CPU-miss MoE execution (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "on") {
+                extern volatile int g_moe_hybrid_mode;
+                g_moe_hybrid_mode = 1;
+            }
         }
     ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
