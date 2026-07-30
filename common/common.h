@@ -482,6 +482,12 @@ struct common_params {
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model
 
+    // MoE expert cache params
+    size_t moe_cache_bytes    = 0;         // per-GPU cache budget in bytes (0 = disabled)
+    std::string moe_cache_policy = "lru";  // "lru" or "slru"
+    int moe_cache_admission   = 2;         // promote after N misses (default 2 per plan)
+    bool moe_cache_prefill    = false;     // admit experts during prefill
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
