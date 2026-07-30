@@ -18,6 +18,9 @@
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
+// Forward declaration for MoE cache (defined in ggml-sycl).
+struct moe_expert_cache;
+
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -139,6 +142,36 @@ int llama_server(common_params & params, int argc, char ** argv) {
     common_params_print_info(params, !is_router_server);
 
     if (!is_router_server) {
+        // Pass MoE cache config to the SYCL backend globals.
+        // These symbols live in ggml-sycl; declared weak so non-SYCL builds
+        // link (they resolve to nullptr there). Skipped for router-mode
+        // instances, which never load a model or touch the GPU.
+        {
+#if defined(__GNUC__)
+#define MOE_CACHE_WEAK __attribute__((weak))
+#else
+#define MOE_CACHE_WEAK
+#endif
+            extern volatile size_t g_moe_cache_budget_bytes MOE_CACHE_WEAK;
+            extern volatile size_t g_moe_cache_admission MOE_CACHE_WEAK;
+            extern volatile char   g_moe_cache_policy[] MOE_CACHE_WEAK;
+#undef MOE_CACHE_WEAK
+            if (&g_moe_cache_budget_bytes != nullptr) {
+                g_moe_cache_budget_bytes = params.moe_cache_bytes;
+                g_moe_cache_admission = params.moe_cache_admission;
+                snprintf((char *)g_moe_cache_policy, 16, "%s", params.moe_cache_policy.c_str());
+            }
+            if (params.moe_cache_bytes > 0) {
+                if (&g_moe_cache_budget_bytes != nullptr) {
+                    SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
+                            params.moe_cache_bytes, params.moe_cache_policy.c_str(),
+                            params.moe_cache_admission);
+                } else {
+                    SRV_WRN("%s", "MoE expert cache requested but this build has no SYCL backend\n");
+                }
+            }
+        }
+
         // validate batch size for embeddings
         // embeddings require all tokens to be processed in a single ubatch
         // see https://github.com/ggml-org/llama.cpp/issues/12836
@@ -233,6 +266,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
+    ctx_http.post("/cache/reset",              ex_wrapper(routes.post_cache_reset));
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models)); // public endpoint (no API key check)
