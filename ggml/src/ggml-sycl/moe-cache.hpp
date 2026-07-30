@@ -33,6 +33,9 @@
 #include <string>
 #include "common.hpp"
 
+// Projections held per expert: gate, up, down.
+#define MOE_CACHE_N_PROJECTIONS 3
+
 // Unique key for a cached expert.
 struct moe_expert_key {
     int32_t layer  = -1;
@@ -85,8 +88,15 @@ struct moe_cache_stats {
     std::atomic<uint64_t> evictions{0};
     std::atomic<uint64_t> promotions{0};
     std::atomic<uint64_t> h2d_bytes{0};
-    std::atomic<uint64_t> cpu_expert_calls{0};
-    std::atomic<uint64_t> gpu_expert_calls{0};
+    // Projection copies the cache declined to serve, so the weights went
+    // host->device as they would with no cache at all.  This was named
+    // cpu_expert_calls, which described CPU expert *execution* -- something
+    // no shipping backend implements (that is Phase G).  Nothing computed
+    // on the CPU here; the copy simply bypassed the cache.
+    std::atomic<uint64_t> host_weight_copy_fallbacks{0};
+    // Projection lookups served from a cache slot.  Counted per projection,
+    // not per expert: one expert use touches gate, up and down separately.
+    std::atomic<uint64_t> cache_served_projections{0};
     std::atomic<uint64_t> prefill_misses{0};
     std::atomic<uint64_t> decode_misses{0};
     std::atomic<uint64_t> prefill_hits{0};
@@ -96,7 +106,7 @@ struct moe_cache_stats {
 
     void reset() {
         hits = misses = evictions = promotions = 0;
-        h2d_bytes = cpu_expert_calls = gpu_expert_calls = 0;
+        h2d_bytes = host_weight_copy_fallbacks = cache_served_projections = 0;
         prefill_misses = decode_misses = prefill_hits = decode_hits = 0;
         slru_promotions = slru_demotions = 0;
     }
@@ -133,7 +143,15 @@ public:
 
     // Record a miss for admission tracking.  During prefill, miss counts
     // are NOT incremented (prefill protection).
-    void record_miss(int32_t layer, int32_t expert);
+    //
+    // Admission state is per (layer, expert, projection).  One use of an
+    // expert misses on gate, up and down separately, so a counter shared
+    // across the three reached an admission threshold of 2 within a single
+    // use -- making "admit on the second use" behave like "admit on the
+    // first".  Worse, a hit on an already-cached projection reset the
+    // shared counter, so whether the remaining projections were ever
+    // admitted depended on the order they happened to be visited in.
+    void record_miss(int32_t layer, int32_t expert, int projection);
 
     // Promote one projection of an expert into the cache.
     // If the expert isn't cached yet, allocates a slot and copies this
@@ -144,8 +162,9 @@ public:
     void * promote_projection(int32_t layer, int32_t expert,
                                int projection, const void * host_src, size_t proj_bytes);
 
-    // Count one expert served from host memory (cache fallback).
-    void inc_cpu_expert_calls() { m_stats.cpu_expert_calls++; }
+    // Count one projection copy that bypassed the cache and went
+    // host->device directly.
+    void inc_host_weight_copy_fallback() { m_stats.host_weight_copy_fallbacks++; }
 
     // Set inference phase: true=prefill, false=decode.
     // During prefill, miss counts are not incremented.
@@ -165,6 +184,17 @@ private:
     int  evict_slru();
     void touch(int slot_id);
     void promote_to_protected(int slot_id);
+
+    // Index into m_miss_counts for one (layer, expert, projection).
+    // Returns -1 when any component is out of range.
+    int  miss_index(int32_t layer, int32_t expert, int projection) const {
+        if (layer < 0 || layer >= m_n_layers ||
+            expert < 0 || expert >= m_n_experts ||
+            projection < 0 || projection >= MOE_CACHE_N_PROJECTIONS) {
+            return -1;
+        }
+        return (layer * m_n_experts + expert) * MOE_CACHE_N_PROJECTIONS + projection;
+    }
 
     queue_ptr m_queue = nullptr;
     bool m_initialized = false;

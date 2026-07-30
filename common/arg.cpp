@@ -2777,6 +2777,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--moe-cache-prefill-admission"}, "on|off",
         "admit experts to cache during prefill (default: off)",
         [](common_params & params, const std::string & value) {
+            // Reject unknown values instead of folding them to "off".
+            // `--moe-cache-prefill-admission true` used to launch a server
+            // with prefill admission silently disabled, so the measurement
+            // taken from it described a configuration nobody asked for.
+            // --moe-cache-policy already validates this way.
+            if (value != "on" && value != "off") {
+                throw std::invalid_argument("invalid value, expected on or off");
+            }
             params.moe_cache_prefill = (value == "on");
         }
     ));
@@ -2790,6 +2798,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // registry proc-address lookup (tools/server/moe-cache-iface.h),
             // not a direct global write, so it works correctly for both
             // static and GGML_BACKEND_DL=ON builds.
+            if (value != "on" && value != "off") {
+                throw std::invalid_argument("invalid value, expected on or off");
+            }
             params.moe_hybrid_mode = (value == "on");
         }
     ));

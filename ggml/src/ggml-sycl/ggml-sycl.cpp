@@ -87,6 +87,13 @@ static volatile size_t g_moe_cache_budget_bytes = 0;
 static volatile size_t g_moe_cache_admission = 1;
 static volatile char   g_moe_cache_policy[16] = "lru";
 static volatile bool   g_moe_cache_prefill_admit = false;
+// Last phase the server announced. The cache is created lazily on the
+// first expert copy, which happens *during* prefill -- so set_phase(true)
+// reached an empty registry and was lost, and the new cache started in
+// decode. Prefill protection then never applied to the first prompt, the
+// one most likely to flood the cache with single-use experts. Recording
+// the phase here lets lazy init adopt it.
+static volatile bool   g_moe_cache_phase_is_prefill = false;
 static volatile int    g_moe_hybrid_mode = 0;  // 0=off, 1=hybrid
 
 // Per-device cache registry. The cache is a device-level resource shared by
@@ -4744,6 +4751,9 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
 
     auto cache = std::make_shared<moe_expert_cache>();
     if (cache->init(cfg, ctx.stream())) {
+        // Adopt the phase the server already announced, rather than the
+        // constructor's decode default.
+        cache->set_phase(g_moe_cache_phase_is_prefill);
         ctx.moe_cache_shared = cache;
         ctx.moe_cache = cache.get();
         ctx.moe_cache_enabled = true;
@@ -4800,7 +4810,7 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     }
 
     // Cache miss: promote to cache slot, then copy from cache slot to dst.
-    ctx->moe_cache->record_miss(layer, expert_id);
+    ctx->moe_cache->record_miss(layer, expert_id, proj);
     void * slot = ctx->moe_cache->promote_projection(layer, expert_id, proj,
                                                       host_src, expert_bytes);
     if (slot) {
@@ -4813,7 +4823,7 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
 
     // Promotion failed (cache full or below admission threshold):
     // fall through to normal host-to-device copy.
-    ctx->moe_cache->inc_cpu_expert_calls();
+    ctx->moe_cache->inc_host_weight_copy_fallback();
     return false;
 }
 
@@ -4894,6 +4904,9 @@ int moe_cache_reset_all() {
 
 // Set inference phase on all caches (true=prefill, false=decode).
 void moe_cache_set_phase_all(bool is_prefill) {
+    // Recorded even when no cache exists yet, so a cache created later in
+    // this phase starts in the right one.
+    g_moe_cache_phase_is_prefill = is_prefill;
     for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
         std::shared_ptr<moe_expert_cache> cache;
         {

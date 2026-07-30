@@ -88,7 +88,7 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
         m_layer_index[l].init(m_n_experts);
     }
 
-    m_miss_counts.assign(m_n_layers * m_n_experts, 0);
+    m_miss_counts.assign((size_t)m_n_layers * m_n_experts * MOE_CACHE_N_PROJECTIONS, 0);
     m_initialized = true;
     m_stats.reset();
     return true;
@@ -137,10 +137,15 @@ void * moe_expert_cache::lookup(int32_t layer, int32_t expert, int projection,
         }
         touch(slot_id);
         m_stats.hits++;
-        m_stats.gpu_expert_calls++;
+        m_stats.cache_served_projections++;
         if (m_is_prefill) m_stats.prefill_hits++;
         else              m_stats.decode_hits++;
-        m_miss_counts[layer * m_n_experts + expert] = 0;
+        // Clear only THIS projection's admission progress.  Clearing the
+        // whole expert's would let a cached gate reset the admission the
+        // still-uncached up and down projections had accumulated.
+        if (int mi = miss_index(layer, expert, projection); mi >= 0) {
+            m_miss_counts[mi] = 0;
+        }
 
         // SLRU: promote probationary slot to protected on second access.
         if (m_use_slru && !m_slots[slot_id].protected_seg &&
@@ -157,19 +162,19 @@ void * moe_expert_cache::lookup(int32_t layer, int32_t expert, int projection,
     return nullptr;
 }
 
-void moe_expert_cache::record_miss(int32_t layer, int32_t expert) {
+void moe_expert_cache::record_miss(int32_t layer, int32_t expert, int projection) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (!m_initialized || layer < 0 || layer >= m_n_layers ||
-        expert < 0 || expert >= m_n_experts) {
-        return;
-    }
+    if (!m_initialized) return;
+    const int idx = miss_index(layer, expert, projection);
+    if (idx < 0) return;
+
     // Prefill protection: don't increment miss counts during prefill
     // unless prefill admission is explicitly enabled.
     if (m_is_prefill && !m_prefill_admit) {
         return;
     }
-    m_miss_counts[layer * m_n_experts + expert]++;
+    m_miss_counts[idx]++;
 }
 
 void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
@@ -188,7 +193,8 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
                           projection == 2 ? m_down_bytes : 0;
     if (expect == 0 || expect != proj_bytes) return nullptr;
 
-    int idx = layer * m_n_experts + expert;
+    const int idx = miss_index(layer, expert, projection);
+    if (idx < 0) return nullptr;
     if (m_miss_counts[idx] < m_admission_misses) {
         return nullptr;
     }
@@ -306,8 +312,8 @@ std::string moe_expert_cache::stats_json() const {
     ss << "\"evictions\":" << m_stats.evictions.load() << ",";
     ss << "\"promotions\":" << m_stats.promotions.load() << ",";
     ss << "\"h2d_bytes\":" << m_stats.h2d_bytes.load() << ",";
-    ss << "\"gpu_expert_calls\":" << m_stats.gpu_expert_calls.load() << ",";
-    ss << "\"cpu_expert_calls\":" << m_stats.cpu_expert_calls.load() << ",";
+    ss << "\"cache_served_projections\":" << m_stats.cache_served_projections.load() << ",";
+    ss << "\"host_weight_copy_fallbacks\":" << m_stats.host_weight_copy_fallbacks.load() << ",";
     ss << "\"prefill_hits\":" << m_stats.prefill_hits.load() << ",";
     ss << "\"prefill_misses\":" << m_stats.prefill_misses.load() << ",";
     ss << "\"decode_hits\":" << m_stats.decode_hits.load() << ",";

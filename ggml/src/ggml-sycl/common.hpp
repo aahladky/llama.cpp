@@ -489,8 +489,11 @@ struct ggml_backend_sycl_context {
     // of moe_cache_shared.get() kept for hot-path reads without touching
     // the shared_ptr's control block on every mul_mat_id call. See
     // g_moe_cache_registry in ggml-sycl.cpp.
-    std::shared_ptr<struct moe_expert_cache> moe_cache_shared;
-    struct moe_expert_cache * moe_cache = nullptr;
+    // moe_expert_cache is a class (moe-cache.hpp); declaring it `struct`
+    // here made every translation unit including both headers warn under
+    // -Wmismatched-tags.
+    std::shared_ptr<class moe_expert_cache> moe_cache_shared;
+    class moe_expert_cache * moe_cache = nullptr;
     bool moe_cache_enabled = false;
     bool moe_cache_init_failed = false;  // don't retry lazy init after failure
 #endif

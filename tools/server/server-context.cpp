@@ -4440,49 +4440,48 @@ void server_routes::init_routes() {
             if (cache_json_str != "[]") {
                 try {
                     json cache_stats = json::parse(cache_json_str);
-                    for (const auto & dev_stats : cache_stats) {
-                        std::string dev = dev_stats.value("device", "unknown");
-                        std::string labels = "{device=\"" + dev + "\"}";
 
-                        prometheus << "# HELP llamacpp:moe_cache_hits_total MoE expert cache hits\n"
-                                   << "# TYPE llamacpp:moe_cache_hits_total counter\n"
-                                   << "llamacpp:moe_cache_hits_total" << labels
-                                   << " " << dev_stats.value("hits", (uint64_t)0) << "\n";
+                    // HELP/TYPE must appear exactly once per metric family.
+                    // Emitting them inside the per-device loop repeated the
+                    // metadata for every GPU, which is invalid exposition
+                    // format and is rejected by strict scrapers -- so on a
+                    // two-GPU machine the cache metrics were unparseable.
+                    struct moe_metric {
+                        const char * name;
+                        const char * help;
+                        const char * type;
+                        const char * key;
+                        bool is_double;
+                    };
+                    static const moe_metric metrics[] = {
+                        { "llamacpp:moe_cache_hits_total", "MoE expert cache hits", "counter", "hits", false },
+                        { "llamacpp:moe_cache_misses_total", "MoE expert cache misses", "counter", "misses", false },
+                        { "llamacpp:moe_cache_evictions_total", "MoE expert cache evictions", "counter", "evictions", false },
+                        { "llamacpp:moe_cache_promotions_total", "MoE expert cache promotions", "counter", "promotions", false },
+                        { "llamacpp:moe_cache_slots", "Total cache slots", "gauge", "slot_count", false },
+                        { "llamacpp:moe_cache_slots_used", "Used cache slots", "gauge", "slots_used", false },
+                        { "llamacpp:moe_cache_hit_ratio", "Cache hit ratio", "gauge", "hit_rate", true },
+                        { "llamacpp:moe_cache_h2d_bytes_total", "Host-to-device copy bytes", "counter", "h2d_bytes", false },
+                        { "llamacpp:moe_cache_served_projections_total",
+                          "Projection lookups served from a cache slot", "counter",
+                          "cache_served_projections", false },
+                        { "llamacpp:moe_cache_host_weight_copy_fallbacks_total",
+                          "Projection copies that bypassed the cache and went host-to-device",
+                          "counter", "host_weight_copy_fallbacks", false },
+                    };
 
-                        prometheus << "# HELP llamacpp:moe_cache_misses_total MoE expert cache misses\n"
-                                   << "# TYPE llamacpp:moe_cache_misses_total counter\n"
-                                   << "llamacpp:moe_cache_misses_total" << labels
-                                   << " " << dev_stats.value("misses", (uint64_t)0) << "\n";
-
-                        prometheus << "# HELP llamacpp:moe_cache_evictions_total MoE expert cache evictions\n"
-                                   << "# TYPE llamacpp:moe_cache_evictions_total counter\n"
-                                   << "llamacpp:moe_cache_evictions_total" << labels
-                                   << " " << dev_stats.value("evictions", (uint64_t)0) << "\n";
-
-                        prometheus << "# HELP llamacpp:moe_cache_promotions_total MoE expert cache promotions\n"
-                                   << "# TYPE llamacpp:moe_cache_promotions_total counter\n"
-                                   << "llamacpp:moe_cache_promotions_total" << labels
-                                   << " " << dev_stats.value("promotions", (uint64_t)0) << "\n";
-
-                        prometheus << "# HELP llamacpp:moe_cache_slots Total cache slots\n"
-                                   << "# TYPE llamacpp:moe_cache_slots gauge\n"
-                                   << "llamacpp:moe_cache_slots" << labels
-                                   << " " << dev_stats.value("slot_count", 0) << "\n";
-
-                        prometheus << "# HELP llamacpp:moe_cache_slots_used Used cache slots\n"
-                                   << "# TYPE llamacpp:moe_cache_slots_used gauge\n"
-                                   << "llamacpp:moe_cache_slots_used" << labels
-                                   << " " << dev_stats.value("slots_used", 0) << "\n";
-
-                        prometheus << "# HELP llamacpp:moe_cache_hit_ratio Cache hit ratio\n"
-                                   << "# TYPE llamacpp:moe_cache_hit_ratio gauge\n"
-                                   << "llamacpp:moe_cache_hit_ratio" << labels
-                                   << " " << dev_stats.value("hit_rate", 0.0) << "\n";
-
-                        prometheus << "# HELP llamacpp:moe_cache_h2d_bytes_total Host-to-device copy bytes\n"
-                                   << "# TYPE llamacpp:moe_cache_h2d_bytes_total counter\n"
-                                   << "llamacpp:moe_cache_h2d_bytes_total" << labels
-                                   << " " << dev_stats.value("h2d_bytes", (uint64_t)0) << "\n";
+                    for (const auto & m : metrics) {
+                        prometheus << "# HELP " << m.name << " " << m.help << "\n"
+                                   << "# TYPE " << m.name << " " << m.type << "\n";
+                        for (const auto & dev_stats : cache_stats) {
+                            const std::string dev = dev_stats.value("device", "unknown");
+                            prometheus << m.name << "{device=\"" << dev << "\"} ";
+                            if (m.is_double) {
+                                prometheus << dev_stats.value(m.key, 0.0) << "\n";
+                            } else {
+                                prometheus << dev_stats.value(m.key, (uint64_t)0) << "\n";
+                            }
+                        }
                     }
                 } catch (...) {
                     // JSON parse failure — skip cache metrics.
