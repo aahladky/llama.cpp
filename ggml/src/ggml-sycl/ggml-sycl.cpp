@@ -67,6 +67,22 @@
 #include "ggml-sycl/conv2d-transpose.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+
+#ifdef GGML_MOE_EXPERT_CACHE
+#include "ggml-sycl/moe-cache.hpp"
+#include <cstring>
+#include "moe-hybrid.hpp"
+// Global budget set by server from --moe-cache-bytes CLI arg.
+volatile size_t g_moe_cache_budget_bytes = 0;
+volatile size_t g_moe_cache_admission = 1;
+volatile char   g_moe_cache_policy[16] = "lru";
+volatile int    g_moe_hybrid_mode = 0;  // 0=off, 1=hybrid
+
+// Per-device cache instances, indexed by device ID.
+// Populated during lazy_init so the metrics endpoint can read stats
+// without needing access to the SYCL backend context.
+moe_expert_cache * g_moe_cache_instances[GGML_SYCL_MAX_DEVICES] = {nullptr};
+#endif
 #include "ggml-sycl/ssm_scan.hpp"
 #include "ggml-sycl/fill.hpp"
 #include "ggml-sycl/cumsum.hpp"
@@ -4626,6 +4642,202 @@ static void mmid_counting_sort_rows(
     }
 }
 
+#ifdef GGML_MOE_EXPERT_CACHE
+// Parse layer index from tensor name like "blk.5.ffn_gate_exps".
+// Returns -1 if not a MoE expert tensor.
+static int moe_cache_parse_layer(const char * name) {
+    if (!name) return -1;
+    if (strncmp(name, "blk.", 4) != 0) return -1;
+    if (!strstr(name, "exps")) return -1;
+    return atoi(name + 4);
+}
+
+// Determine projection type from tensor name: 0=gate, 1=up, 2=down, -1=unknown.
+static int moe_cache_parse_projection(const char * name) {
+    if (!name) return -1;
+    if (strstr(name, "gate_exps") || strstr(name, "gate_up_exps")) return 0;
+    if (strstr(name, "up_exps"))   return 1;
+    if (strstr(name, "down_exps")) return 2;
+    return -1;
+}
+
+// Lazy cache initialization: called from the scheduler hook on the first
+// cache-eligible expert copy.  The hook receives the original host tensor
+// name ("blk.N.ffn_*_exps"), so this fires even when ALL MoE layers are
+// CPU-resident and the SYCL graph never sees the weight tensors directly.
+// Runs on the compute thread only, so no extra synchronization is needed.
+static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
+                                const char * tensor_name,
+                                int32_t n_experts, size_t expert_bytes) {
+    if (ctx.moe_cache || ctx.moe_cache_init_failed) return;  // already handled
+
+    int layer = moe_cache_parse_layer(tensor_name);
+    if (layer < 0) return;
+
+    // Total budget comes from a global set by server.
+    if (g_moe_cache_budget_bytes == 0) return;
+
+    moe_cache_config cfg;
+    cfg.device_id = ctx.device;
+    cfg.budget_bytes = g_moe_cache_budget_bytes;
+    cfg.n_layers = 256;  // generous upper bound; actual layers are sparse
+    cfg.n_experts = n_experts;  // per-projection expert count
+    // Slot must hold all three projections (gate+up+down).
+    // All three are typically the same size; projections whose actual size
+    // differs from the init-time size are rejected by the geometry guards
+    // in lookup/promote_projection and simply never cached.
+    cfg.expert_bytes = expert_bytes * 3;
+    cfg.gate_bytes = expert_bytes;
+    cfg.up_bytes = expert_bytes;
+    cfg.down_bytes = expert_bytes;
+    cfg.policy = (const char *)g_moe_cache_policy;
+    cfg.admission_misses = (int)g_moe_cache_admission;
+
+    ctx.moe_cache = new moe_expert_cache();
+    if (ctx.moe_cache->init(cfg, ctx.stream())) {
+        ctx.moe_cache_enabled = true;
+        g_moe_cache_instances[ctx.device] = ctx.moe_cache;
+        fprintf(stderr, "moe_cache: initialized on device %d, %d slots, %zu bytes budget\n",
+                ctx.device, ctx.moe_cache->slot_count(),
+                ctx.moe_cache->budget_bytes());
+    } else {
+        fprintf(stderr, "moe_cache: init failed on device %d\n", ctx.device);
+        delete ctx.moe_cache;
+        ctx.moe_cache = nullptr;
+        ctx.moe_cache_init_failed = true;
+    }
+}
+
+// MoE cache hook for the scheduler: called before copying each expert
+// from host to device.  Checks the cache for the expert; on hit, copies
+// from cache slot to dst (GPU-to-GPU).  On miss, promotes to cache slot
+// and copies from cache slot to dst.  Returns true if copied from cache.
+static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name,
+                                 int32_t expert_id, int32_t n_experts,
+                                 const uint8_t * host_src,
+                                 size_t expert_bytes, uint8_t * dst) {
+    // The hook is registered globally; only handle SYCL backends so the
+    // context cast below is safe in mixed-backend builds.
+    if (!ggml_backend_is_sycl(backend)) return false;
+
+    ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backend->context;
+
+    if (!ctx->moe_cache) {
+        moe_cache_lazy_init(*ctx, tensor_name, n_experts, expert_bytes);
+    }
+    if (!ctx->moe_cache_enabled || !ctx->moe_cache) return false;
+
+    int layer = moe_cache_parse_layer(tensor_name);
+    int proj  = moe_cache_parse_projection(tensor_name);
+    if (layer < 0 || proj < 0) return false;
+
+    // MMQ kernels can read a few bytes past the end of the expert weights;
+    // copy the padding tail from host (as the non-cache path in
+    // ggml-backend.cpp does) so there are no NaNs in the padding.
+    const size_t padding = expert_id < n_experts - 1
+                         ? std::min(expert_bytes, (size_t)512) : 0;
+
+    // Check cache for this expert+projection.
+    void * cached = ctx->moe_cache->lookup(layer, expert_id, proj, expert_bytes);
+    if (cached) {
+        // Cache hit: copy from cache slot to dst (GPU-to-GPU).
+        // dst is input_cpy->data + eid * expert_size.
+        // The compute kernel will read from input_cpy as usual.
+        ctx->stream()->memcpy(dst, cached, expert_bytes);
+        if (padding > 0) {
+            ctx->stream()->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
+        }
+        return true;
+    }
+
+    // Cache miss: promote to cache slot, then copy from cache slot to dst.
+    ctx->moe_cache->record_miss(layer, expert_id);
+    void * slot = ctx->moe_cache->promote_projection(layer, expert_id, proj,
+                                                      host_src, expert_bytes);
+    if (slot) {
+        ctx->stream()->memcpy(dst, slot, expert_bytes);
+        if (padding > 0) {
+            ctx->stream()->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
+        }
+        return true;
+    }
+
+    // Promotion failed (cache full or below admission threshold):
+    // fall through to normal host-to-device copy.
+    ctx->moe_cache->inc_cpu_expert_calls();
+    return false;
+}
+
+// Global hybrid metrics (accumulated across all layers).
+// NOTE: true GPU-hit/CPU-miss hybrid execution is NOT implemented. Misses
+// under --moe-hybrid-mode execute on the same device mul_mat as everything
+// else, so they are counted as gpu_fallback_rows -- never as CPU misses.
+// hit_rows/miss_rows and the timing/bytes counters below stay at 0 until a
+// real CPU-miss path (see the unreferenced stubs in moe-hybrid.cpp) lands;
+// they are reported for stats-schema stability only.
+static std::atomic<int64_t> g_hybrid_hit_rows{0};
+static std::atomic<int64_t> g_hybrid_miss_rows{0};
+static std::atomic<int64_t> g_hybrid_gpu_fallback_rows{0};
+static std::atomic<double>  g_hybrid_cpu_miss_time_ms{0.0};
+static std::atomic<double>  g_hybrid_gpu_hit_time_ms{0.0};
+static std::atomic<double>  g_hybrid_merge_time_ms{0.0};
+static std::atomic<int64_t> g_hybrid_h2d_bytes_avoided{0};
+
+// Collect cache stats from all initialized caches.
+std::string moe_cache_collect_stats() {
+    std::string result = "[";
+    bool first = true;
+    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+        auto * cache = g_moe_cache_instances[dev];
+        if (cache && cache->is_initialized()) {
+            if (!first) result += ",";
+            first = false;
+            // stats_json() returns {"hits":N,...} — strip outer braces
+            // and merge into the device object.
+            std::string stats = cache->stats_json();
+            // Remove leading { and trailing }
+            if (stats.front() == '{') stats = stats.substr(1);
+            if (stats.back() == '}') stats.pop_back();
+            result += "{\"device\":\"SYCL" + std::to_string(dev) + "\"," + stats;
+            // Append hybrid metrics.  cpu_miss_time_ms / h2d_bytes_avoided
+            // are always 0: no CPU-miss execution exists yet, so no CPU time
+            // is spent and no H2D bytes are avoided.
+            result += ",\"hit_rows\":" + std::to_string(g_hybrid_hit_rows.load());
+            result += ",\"miss_rows\":" + std::to_string(g_hybrid_miss_rows.load());
+            result += ",\"gpu_fallback_rows\":" + std::to_string(g_hybrid_gpu_fallback_rows.load());
+            result += ",\"cpu_miss_time_ms\":" + std::to_string(g_hybrid_cpu_miss_time_ms.load());
+            result += ",\"gpu_hit_time_ms\":" + std::to_string(g_hybrid_gpu_hit_time_ms.load());
+            result += ",\"merge_time_ms\":" + std::to_string(g_hybrid_merge_time_ms.load());
+            result += ",\"h2d_bytes_avoided\":" + std::to_string(g_hybrid_h2d_bytes_avoided.load());
+            result += "}";
+        }
+    }
+    result += "]";
+    return result;
+}
+
+// Reset all caches.  Returns number of devices reset.
+int moe_cache_reset_all() {
+    int count = 0;
+    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+        if (g_moe_cache_instances[dev] && g_moe_cache_instances[dev]->is_initialized()) {
+            g_moe_cache_instances[dev]->reset();
+            count++;
+        }
+    }
+    return count;
+}
+
+// Set inference phase on all caches (true=prefill, false=decode).
+void moe_cache_set_phase_all(bool is_prefill) {
+    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+        if (g_moe_cache_instances[dev] && g_moe_cache_instances[dev]->is_initialized()) {
+            g_moe_cache_instances[dev]->set_phase(is_prefill);
+        }
+    }
+}
+#endif
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -4744,6 +4956,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
+        // Hybrid dispatch: true GPU-hit/CPU-miss execution is NOT
+        // implemented. Every expert -- hit or miss -- executes on the device
+        // via the same mul_mat below; cache misses fall back to GPU. The
+        // previous placeholder hit classification
+        // (lookup(layer=0, projection=0, proj_bytes=0)) could never return a
+        // real hit (the geometry guard in moe_expert_cache::lookup rejects
+        // proj_bytes=0) and has been removed. Rows run under
+        // --moe-hybrid-mode are therefore reported conservatively as
+        // gpu_fallback_rows, never as CPU misses. The unreferenced stubs in
+        // moe-hybrid.cpp (moe_build_partition / moe_cpu_miss_execute /
+        // moe_merge_outputs) are reserved for a future phase.
+        const bool hybrid_active = g_moe_hybrid_mode &&
+                                   ctx.moe_cache && ctx.moe_cache_enabled;
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             const int64_t num_src1_rows = expert_row_counts[i02];
 
@@ -4753,6 +4978,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
             const int64_t expert_row_offset = expert_row_offsets[i02];
 
+            // GPU path: device mul_mat for all experts (hybrid "misses"
+            // included -- CPU-miss execution is not implemented).
             src0_row.data = src0_original + i02*nb02;
 
             GGML_ASSERT(nb11 == sizeof(float)*ne10);
@@ -4771,6 +4998,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             dst_row.nb[3] = num_src1_rows*nb1;
 
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+
+            if (hybrid_active) {
+                // GPU fallback, not a CPU miss: count separately so metrics
+                // never imply CPU execution that did not happen.
+                g_hybrid_gpu_fallback_rows += num_src1_rows;
+            }
         }
 
         {
@@ -5282,6 +5515,16 @@ static const char * ggml_backend_sycl_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_sycl_free(ggml_backend_t backend) {
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+
+#ifdef GGML_MOE_EXPERT_CACHE
+    // Free the MoE expert cache and clear its registry entry so the metrics
+    // endpoint stops reporting this device.
+    if (sycl_ctx->moe_cache) {
+        g_moe_cache_instances[sycl_ctx->device] = nullptr;
+        delete sycl_ctx->moe_cache;
+        sycl_ctx->moe_cache = nullptr;
+    }
+#endif
 
     delete sycl_ctx;
     delete backend;
@@ -6491,6 +6734,17 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), device),
         /* .context = */ ctx
     };
+
+#ifdef GGML_MOE_EXPERT_CACHE
+    // Register the cache hook with the scheduler so it checks the cache
+    // before copying experts from host to device.  Only register when a
+    // cache budget was configured (the server sets the globals from CLI
+    // args before backend init); with a zero budget the per-expert hook
+    // loop would be pure overhead.
+    if (g_moe_cache_budget_bytes > 0) {
+        ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
+    }
+#endif
 
     return sycl_backend;
 }
