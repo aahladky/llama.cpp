@@ -335,3 +335,13 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# MoE expert cache unit tests (roadmap Task F8): tests/test-moe-cache.cpp.
+#
+# NOT built yet. The tests themselves are host-only -- no GPU is needed at
+# runtime -- but moe-cache.hpp includes ggml-sycl/common.hpp, which drags in
+# the SYCL headers and the ggml-sycl target's private compile definitions
+# (GGML_SYCL_WARP_SIZE and friends). Reproducing that build configuration in
+# a test target is the wrong fix; the cache's policy state (admission,
+# eviction, phase) needs separating from its device concerns first, after
+# which this compiles as a plain C++ test with no SYCL at all.

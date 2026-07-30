@@ -125,6 +125,12 @@ struct moe_cache_config {
     std::string policy  = "lru";
     int admission_misses = 1;
     bool prefill_admit   = false;
+    // Host-only mode for unit tests: slots are allocated with malloc and
+    // no device copies are issued, so the admission, eviction, phase and
+    // reset logic can be exercised on a machine with no GPU. Requires a
+    // null queue; a non-null queue always takes the real device path, so
+    // this cannot be reached by accident in production.
+    bool host_only_for_testing = false;
 };
 
 // The cache itself.
@@ -198,6 +204,13 @@ private:
 
     queue_ptr m_queue = nullptr;
     bool m_initialized = false;
+    bool m_host_only = false;
+    // Single contiguous allocation backing every slot. One reservation is
+    // cheaper for the allocator than n_slots separate ones and cannot end
+    // up fragmented across the device's address space; slots point into
+    // it at fixed offsets.
+    void * m_pool = nullptr;
+    size_t m_pool_bytes = 0;
     size_t m_budget_bytes = 0;
     int m_n_layers = 0;
     int m_n_experts = 0;

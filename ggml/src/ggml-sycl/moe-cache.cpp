@@ -7,20 +7,28 @@
 #include <sstream>
 
 moe_expert_cache::~moe_expert_cache() {
-    if (m_queue) {
-        for (auto & slot : m_slots) {
-            if (slot.device_ptr) {
-                try {
-                    sycl::free(slot.device_ptr, *m_queue);
-                } catch (...) {}
-                slot.device_ptr = nullptr;
-            }
+    // Slots point into one pool allocation; freeing the pool frees them all.
+    if (m_pool) {
+        if (m_host_only) {
+            free(m_pool);
+        } else if (m_queue) {
+            try {
+                ggml_sycl_free_device(m_pool, *m_queue);
+            } catch (...) {}
         }
+        m_pool = nullptr;
+    }
+    for (auto & slot : m_slots) {
+        slot.device_ptr = nullptr;
     }
 }
 
 bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
-    if (!queue || cfg.budget_bytes == 0 || cfg.n_layers == 0 ||
+    // Host-only is opt-in AND requires a null queue, so a production caller
+    // that accidentally passes null still gets a hard failure rather than a
+    // silently device-less cache.
+    m_host_only = (queue == nullptr) && cfg.host_only_for_testing;
+    if ((!queue && !m_host_only) || cfg.budget_bytes == 0 || cfg.n_layers == 0 ||
         cfg.n_experts == 0 || cfg.expert_bytes == 0) {
         return false;
     }
@@ -38,42 +46,51 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
     m_is_prefill      = false;
     m_use_slru        = (cfg.policy == "slru");
 
-    size_t slot_bytes = cfg.gate_bytes + cfg.up_bytes + cfg.down_bytes;
-    if (slot_bytes == 0) {
-        slot_bytes = cfg.expert_bytes;
+    // Projection sizes are taken individually rather than assumed equal, so
+    // a model whose gate/up/down differ still gets correctly sized regions.
+    // A layout that reports no per-projection sizes at all is not cacheable:
+    // guessing would mean over-reading the host weights.
+    if (cfg.gate_bytes == 0 || cfg.up_bytes == 0 || cfg.down_bytes == 0) {
+        fprintf(stderr, "moe_cache: refusing to initialize -- projection geometry "
+                        "unknown (gate=%zu up=%zu down=%zu)\n",
+                cfg.gate_bytes, cfg.up_bytes, cfg.down_bytes);
+        return false;
     }
+    const size_t slot_bytes = cfg.gate_bytes + cfg.up_bytes + cfg.down_bytes;
+
     int n_slots = (int)(cfg.budget_bytes / slot_bytes);
     if (n_slots <= 0) {
         return false;
     }
     m_protected_limit = m_use_slru ? std::max(1, (int)(n_slots * 0.8)) : 0;
 
+    // One contiguous pool for every slot rather than n_slots separate
+    // device allocations: fewer allocator round-trips, and the cache cannot
+    // end up scattered across the device address space.
+    m_pool_bytes = slot_bytes * (size_t)n_slots;
+    if (m_host_only) {
+        m_pool = malloc(m_pool_bytes);
+    } else {
+        try {
+            m_pool = ggml_sycl_malloc_device(m_pool_bytes, *queue);
+        } catch (const sycl::exception & e) {
+            fprintf(stderr, "moe_cache: pool allocation of %zu bytes failed: %s\n",
+                    m_pool_bytes, e.what());
+            m_pool = nullptr;
+        }
+    }
+    // USM allocators can return null on OOM without throwing, so the
+    // try/catch above is not sufficient on its own.
+    if (!m_pool) {
+        fprintf(stderr, "moe_cache: pool allocation of %zu bytes returned null\n",
+                m_pool_bytes);
+        m_pool_bytes = 0;
+        return false;
+    }
+
     m_slots.resize(n_slots);
     for (int i = 0; i < n_slots; i++) {
-        try {
-            m_slots[i].device_ptr = sycl::malloc_device(slot_bytes, *queue);
-        } catch (const sycl::exception & e) {
-            fprintf(stderr, "moe_cache: failed to allocate slot %d (%zu bytes): %s\n",
-                    i, slot_bytes, e.what());
-            for (int j = 0; j < i; j++) {
-                sycl::free(m_slots[j].device_ptr, *queue);
-                m_slots[j].device_ptr = nullptr;
-            }
-            m_slots.clear();
-            return false;
-        }
-        // malloc_device can return null without throwing (e.g. some USM
-        // allocators on OOM); the try/catch above alone doesn't cover that.
-        if (!m_slots[i].device_ptr) {
-            fprintf(stderr, "moe_cache: allocation returned null for slot %d (%zu bytes)\n",
-                    i, slot_bytes);
-            for (int j = 0; j < i; j++) {
-                sycl::free(m_slots[j].device_ptr, *queue);
-                m_slots[j].device_ptr = nullptr;
-            }
-            m_slots.clear();
-            return false;
-        }
+        m_slots[i].device_ptr = (char *)m_pool + (size_t)i * slot_bytes;
         m_slots[i].bytes = slot_bytes;
         m_slots[i].gate_bytes = cfg.gate_bytes;
         m_slots[i].up_bytes   = cfg.up_bytes;
@@ -243,12 +260,18 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
     if (bytes == 0) return nullptr;
 
     try {
-        // Async copy: submit without blocking.  The copy is ordered on the
-        // same queue as subsequent compute, so the GPU serializes it before
-        // any kernel that touches this slot.  Never .wait() in the
-        // steady-state loop -- that would stall the pipeline (plan §5.1).
-        auto ev = m_queue->memcpy((char *)slot.device_ptr + offset, host_src, bytes);
-        (void)ev;  // event available if a future consumer needs explicit sync
+        if (m_host_only) {
+            // Unit-test mode: the "device" pool is host memory, so a plain
+            // copy keeps the contents checkable without a GPU.
+            memcpy((char *)slot.device_ptr + offset, host_src, bytes);
+        } else {
+            // Async copy: submit without blocking.  The copy is ordered on the
+            // same queue as subsequent compute, so the GPU serializes it before
+            // any kernel that touches this slot.  Never .wait() in the
+            // steady-state loop -- that would stall the pipeline (plan §5.1).
+            auto ev = m_queue->memcpy((char *)slot.device_ptr + offset, host_src, bytes);
+            (void)ev;  // event available if a future consumer needs explicit sync
+        }
     } catch (const sycl::exception & e) {
         fprintf(stderr, "moe_cache: promote_projection failed: %s\n", e.what());
         return nullptr;
