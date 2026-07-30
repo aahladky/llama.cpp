@@ -222,6 +222,28 @@ extern "C" {
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
 
+    // MoE expert-weight cache (currently implemented by the SYCL backend only).
+    // Looked up by versioned name so callers (e.g. tools/server) never assume
+    // it exists: a build without the feature simply has no backend reg that
+    // resolves these names, and ggml_backend_reg_get_proc_address returns NULL.
+    struct ggml_backend_moe_cache_config {
+        size_t      budget_bytes;      // per-device cache budget; 0 disables the cache on that device
+        int         admission_misses;  // promote to cached after N misses
+        const char *policy;            // "lru" or "slru"
+        bool        prefill_admit;     // count misses seen during prefill toward admission
+    };
+    typedef void         (*ggml_backend_moe_cache_configure_t)(const struct ggml_backend_moe_cache_config * cfg);
+    typedef int          (*ggml_backend_moe_cache_reset_all_t)(void);
+    typedef void         (*ggml_backend_moe_cache_set_phase_t)(bool is_prefill);
+    typedef const char * (*ggml_backend_moe_cache_stats_json_t)(void);
+    typedef void         (*ggml_backend_moe_hybrid_set_mode_t)(int mode);
+    // Lookup names (pass to ggml_backend_reg_get_proc_address):
+    //   "ggml_backend_moe_cache_configure_v1"
+    //   "ggml_backend_moe_cache_reset_all_v1"
+    //   "ggml_backend_moe_cache_set_phase_v1"
+    //   "ggml_backend_moe_cache_stats_json_v1"
+    //   "ggml_backend_moe_hybrid_set_mode_v1"
+
     //
     // Backend registry
     //

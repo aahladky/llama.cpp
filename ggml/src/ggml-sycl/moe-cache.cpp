@@ -62,6 +62,18 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
             m_slots.clear();
             return false;
         }
+        // malloc_device can return null without throwing (e.g. some USM
+        // allocators on OOM); the try/catch above alone doesn't cover that.
+        if (!m_slots[i].device_ptr) {
+            fprintf(stderr, "moe_cache: allocation returned null for slot %d (%zu bytes)\n",
+                    i, slot_bytes);
+            for (int j = 0; j < i; j++) {
+                sycl::free(m_slots[j].device_ptr, *queue);
+                m_slots[j].device_ptr = nullptr;
+            }
+            m_slots.clear();
+            return false;
+        }
         m_slots[i].bytes = slot_bytes;
         m_slots[i].gate_bytes = cfg.gate_bytes;
         m_slots[i].up_bytes   = cfg.up_bytes;

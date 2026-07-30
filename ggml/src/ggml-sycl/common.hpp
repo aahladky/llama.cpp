@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 
 #include "dpct/helper.hpp"
@@ -480,7 +481,15 @@ struct ggml_backend_sycl_context {
 
 #ifdef GGML_MOE_EXPERT_CACHE
     // MoE expert cache: persistent GPU slots for routed expert weights.
-    // One cache per device context; initialized lazily on first use.
+    // The cache is a device-level resource, not a context-level one --
+    // multiple contexts on the same device (e.g. main + draft/MTP) share
+    // one cache instance via a ref-counted std::shared_ptr, so freeing one
+    // context's backend never invalidates the pointer another context still
+    // holds. moe_cache_shared owns the reference; moe_cache is a raw alias
+    // of moe_cache_shared.get() kept for hot-path reads without touching
+    // the shared_ptr's control block on every mul_mat_id call. See
+    // g_moe_cache_registry in ggml-sycl.cpp.
+    std::shared_ptr<struct moe_expert_cache> moe_cache_shared;
     struct moe_expert_cache * moe_cache = nullptr;
     bool moe_cache_enabled = false;
     bool moe_cache_init_failed = false;  // don't retry lazy init after failure

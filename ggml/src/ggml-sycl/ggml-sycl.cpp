@@ -71,17 +71,38 @@
 #ifdef GGML_MOE_EXPERT_CACHE
 #include "ggml-sycl/moe-cache.hpp"
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include "moe-hybrid.hpp"
-// Global budget set by server from --moe-cache-bytes CLI arg.
-volatile size_t g_moe_cache_budget_bytes = 0;
-volatile size_t g_moe_cache_admission = 1;
-volatile char   g_moe_cache_policy[16] = "lru";
-volatile int    g_moe_hybrid_mode = 0;  // 0=off, 1=hybrid
+// Cache configuration, set via ggml_backend_moe_cache_configure_v1 (see
+// ggml_backend_sycl_reg_get_proc_address below) -- no longer written
+// directly by the server as weak externs. That pattern relied on the
+// static/dynamic linker resolving a weak symbol across object files, which
+// does not work when the SYCL backend is loaded via GGML_BACKEND_DL=ON
+// (a separately dlopen'd .so does not satisfy a weak extern in the main
+// executable); the registry proc-address lookup works correctly in both
+// static and dynamic-backend builds because it goes through the same
+// backend-registry mechanism regardless of how the backend was loaded.
+static volatile size_t g_moe_cache_budget_bytes = 0;
+static volatile size_t g_moe_cache_admission = 1;
+static volatile char   g_moe_cache_policy[16] = "lru";
+static volatile bool   g_moe_cache_prefill_admit = false;
+static volatile int    g_moe_hybrid_mode = 0;  // 0=off, 1=hybrid
 
-// Per-device cache instances, indexed by device ID.
-// Populated during lazy_init so the metrics endpoint can read stats
-// without needing access to the SYCL backend context.
-moe_expert_cache * g_moe_cache_instances[GGML_SYCL_MAX_DEVICES] = {nullptr};
+// Per-device cache registry. The cache is a device-level resource shared by
+// every ggml_backend_sycl_context on that device (main model, draft/MTP
+// model, etc.) -- see ggml_backend_sycl_context::moe_cache_shared in
+// common.hpp for why. The registry holds only a *weak* reference: it must
+// not keep the cache alive by itself, or it would never be destroyed once
+// every context on a device unloads. A context's own moe_cache_shared
+// (a strong shared_ptr) is what keeps the cache alive for as long as that
+// context is; when the last context on a device drops its reference, the
+// shared_ptr control block destroys the cache automatically and this
+// registry's weak_ptr simply expires (lock() then returns nullptr), so the
+// next context to touch that device correctly allocates a fresh one instead
+// of reusing a stale pointer.
+static std::mutex g_moe_cache_registry_mutex;
+static std::weak_ptr<moe_expert_cache> g_moe_cache_registry[GGML_SYCL_MAX_DEVICES];
 #endif
 #include "ggml-sycl/ssm_scan.hpp"
 #include "ggml-sycl/fill.hpp"
@@ -4665,7 +4686,19 @@ static int moe_cache_parse_projection(const char * name) {
 // cache-eligible expert copy.  The hook receives the original host tensor
 // name ("blk.N.ffn_*_exps"), so this fires even when ALL MoE layers are
 // CPU-resident and the SYCL graph never sees the weight tensors directly.
-// Runs on the compute thread only, so no extra synchronization is needed.
+//
+// The cache is a device-level resource (see g_moe_cache_registry above), so
+// two contexts on the same device (e.g. main + draft/MTP, each with its own
+// compute thread) can call this concurrently for the first time -- the
+// registry mutex serializes creation and reuse. NOTE: the shared cache is
+// initialized once, against whichever context reaches this function first,
+// and its GPU allocations + subsequent lookup/promote SYCL submissions are
+// tied to *that* context's queue (ctx.stream() at init time). Whether it is
+// safe for a second context's compute thread to submit through a cache
+// created against the first context's queue on the same device is an open
+// question this reading pass cannot settle -- it needs the real "two
+// contexts on one GPU" / "main plus draft/MTP context" correctness runs
+// (Task 0.6), not code inspection. Flagging rather than asserting either way.
 static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
                                 const char * tensor_name,
                                 int32_t n_experts, size_t expert_bytes) {
@@ -4674,8 +4707,23 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     int layer = moe_cache_parse_layer(tensor_name);
     if (layer < 0) return;
 
-    // Total budget comes from a global set by server.
+    // Total budget comes from server-configured state (see
+    // ggml_backend_moe_cache_configure_v1).
     if (g_moe_cache_budget_bytes == 0) return;
+
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mutex);
+
+    // Re-check under the lock: another thread may have initialized this
+    // context's cache (or another context's, on the same device) between
+    // the unlocked check above and taking the lock.
+    if (ctx.moe_cache || ctx.moe_cache_init_failed) return;
+
+    if (auto existing = g_moe_cache_registry[ctx.device].lock()) {
+        ctx.moe_cache_shared = existing;
+        ctx.moe_cache = existing.get();
+        ctx.moe_cache_enabled = true;
+        return;
+    }
 
     moe_cache_config cfg;
     cfg.device_id = ctx.device;
@@ -4692,18 +4740,19 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     cfg.down_bytes = expert_bytes;
     cfg.policy = (const char *)g_moe_cache_policy;
     cfg.admission_misses = (int)g_moe_cache_admission;
+    cfg.prefill_admit = g_moe_cache_prefill_admit;
 
-    ctx.moe_cache = new moe_expert_cache();
-    if (ctx.moe_cache->init(cfg, ctx.stream())) {
+    auto cache = std::make_shared<moe_expert_cache>();
+    if (cache->init(cfg, ctx.stream())) {
+        ctx.moe_cache_shared = cache;
+        ctx.moe_cache = cache.get();
         ctx.moe_cache_enabled = true;
-        g_moe_cache_instances[ctx.device] = ctx.moe_cache;
+        g_moe_cache_registry[ctx.device] = cache;  // weak: doesn't extend lifetime
         fprintf(stderr, "moe_cache: initialized on device %d, %d slots, %zu bytes budget\n",
-                ctx.device, ctx.moe_cache->slot_count(),
-                ctx.moe_cache->budget_bytes());
+                ctx.device, cache->slot_count(),
+                cache->budget_bytes());
     } else {
         fprintf(stderr, "moe_cache: init failed on device %d\n", ctx.device);
-        delete ctx.moe_cache;
-        ctx.moe_cache = nullptr;
         ctx.moe_cache_init_failed = true;
     }
 }
@@ -4784,11 +4833,21 @@ static std::atomic<double>  g_hybrid_merge_time_ms{0.0};
 static std::atomic<int64_t> g_hybrid_h2d_bytes_avoided{0};
 
 // Collect cache stats from all initialized caches.
+//
+// Each iteration locks the weak_ptr to a temporary shared_ptr, extending the
+// cache's lifetime for exactly the duration of this read even if the last
+// context on that device is concurrently freeing (and would otherwise drop
+// the last strong reference mid-read). This closes the "metrics during
+// unload" race the raw-pointer registry had no protection against.
 std::string moe_cache_collect_stats() {
     std::string result = "[";
     bool first = true;
     for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
-        auto * cache = g_moe_cache_instances[dev];
+        std::shared_ptr<moe_expert_cache> cache;
+        {
+            std::lock_guard<std::mutex> lock(g_moe_cache_registry_mutex);
+            cache = g_moe_cache_registry[dev].lock();
+        }
         if (cache && cache->is_initialized()) {
             if (!first) result += ",";
             first = false;
@@ -4820,8 +4879,13 @@ std::string moe_cache_collect_stats() {
 int moe_cache_reset_all() {
     int count = 0;
     for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
-        if (g_moe_cache_instances[dev] && g_moe_cache_instances[dev]->is_initialized()) {
-            g_moe_cache_instances[dev]->reset();
+        std::shared_ptr<moe_expert_cache> cache;
+        {
+            std::lock_guard<std::mutex> lock(g_moe_cache_registry_mutex);
+            cache = g_moe_cache_registry[dev].lock();
+        }
+        if (cache && cache->is_initialized()) {
+            cache->reset();
             count++;
         }
     }
@@ -4831,10 +4895,50 @@ int moe_cache_reset_all() {
 // Set inference phase on all caches (true=prefill, false=decode).
 void moe_cache_set_phase_all(bool is_prefill) {
     for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
-        if (g_moe_cache_instances[dev] && g_moe_cache_instances[dev]->is_initialized()) {
-            g_moe_cache_instances[dev]->set_phase(is_prefill);
+        std::shared_ptr<moe_expert_cache> cache;
+        {
+            std::lock_guard<std::mutex> lock(g_moe_cache_registry_mutex);
+            cache = g_moe_cache_registry[dev].lock();
+        }
+        if (cache && cache->is_initialized()) {
+            cache->set_phase(is_prefill);
         }
     }
+}
+
+// Versioned backend-registry procs (see ggml_backend_sycl_reg_get_proc_address
+// below and ggml/include/ggml-backend.h for the typedefs/lookup names).
+static void ggml_backend_sycl_moe_cache_configure_v1(const struct ggml_backend_moe_cache_config * cfg) {
+    if (!cfg) return;
+    g_moe_cache_budget_bytes  = cfg->budget_bytes;
+    g_moe_cache_admission     = (size_t) cfg->admission_misses;
+    g_moe_cache_prefill_admit = cfg->prefill_admit;
+    snprintf((char *) g_moe_cache_policy, sizeof(g_moe_cache_policy), "%s",
+             cfg->policy ? cfg->policy : "lru");
+}
+
+static int ggml_backend_sycl_moe_cache_reset_all_v1(void) {
+    return moe_cache_reset_all();
+}
+
+static void ggml_backend_sycl_moe_cache_set_phase_v1(bool is_prefill) {
+    moe_cache_set_phase_all(is_prefill);
+}
+
+static const char * ggml_backend_sycl_moe_cache_stats_json_v1(void) {
+    // Returned pointer must stay valid after this call returns (the caller
+    // is a C function-pointer boundary, not a C++ std::string owner). A
+    // thread_local buffer keeps each caller's last result alive without a
+    // shared mutable global -- good enough for the server's synchronous
+    // metrics-endpoint and cache-reset use, which read the string
+    // immediately after calling this on one thread.
+    static thread_local std::string s;
+    s = moe_cache_collect_stats();
+    return s.c_str();
+}
+
+static void ggml_backend_sycl_moe_hybrid_set_mode_v1(int mode) {
+    g_moe_hybrid_mode = mode;
 }
 #endif
 
@@ -5517,11 +5621,15 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
 
 #ifdef GGML_MOE_EXPERT_CACHE
-    // Free the MoE expert cache and clear its registry entry so the metrics
-    // endpoint stops reporting this device.
-    if (sycl_ctx->moe_cache) {
-        g_moe_cache_instances[sycl_ctx->device] = nullptr;
-        delete sycl_ctx->moe_cache;
+    // Drop this context's reference to the (possibly shared) device-level
+    // cache. If another context on the same device still holds a
+    // reference via its own moe_cache_shared, the cache stays alive and
+    // g_moe_cache_registry[device]'s weak_ptr keeps resolving to it -- we
+    // must NOT delete the cache or null the registry entry unconditionally
+    // here, only when this was the last reference (which shared_ptr's
+    // control block handles automatically on .reset()).
+    if (sycl_ctx->moe_cache_shared) {
+        sycl_ctx->moe_cache_shared.reset();
         sycl_ctx->moe_cache = nullptr;
     }
 #endif
@@ -6652,6 +6760,28 @@ static void *ggml_backend_sycl_reg_get_proc_address(ggml_backend_reg_t reg, cons
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_sycl_comm_allreduce_tensor;
     }
+
+#ifdef GGML_MOE_EXPERT_CACHE
+    // MoE expert-weight cache. Presence of these procs on this reg IS the
+    // truthful signal that the cache feature is compiled into this backend
+    // build -- callers (tools/server, the --modelctl-capabilities probe)
+    // must not infer cache support merely from a SYCL device existing.
+    if (strcmp(name, "ggml_backend_moe_cache_configure_v1") == 0) {
+        return (void *)ggml_backend_sycl_moe_cache_configure_v1;
+    }
+    if (strcmp(name, "ggml_backend_moe_cache_reset_all_v1") == 0) {
+        return (void *)ggml_backend_sycl_moe_cache_reset_all_v1;
+    }
+    if (strcmp(name, "ggml_backend_moe_cache_set_phase_v1") == 0) {
+        return (void *)ggml_backend_sycl_moe_cache_set_phase_v1;
+    }
+    if (strcmp(name, "ggml_backend_moe_cache_stats_json_v1") == 0) {
+        return (void *)ggml_backend_sycl_moe_cache_stats_json_v1;
+    }
+    if (strcmp(name, "ggml_backend_moe_hybrid_set_mode_v1") == 0) {
+        return (void *)ggml_backend_sycl_moe_hybrid_set_mode_v1;
+    }
+#endif
 
     // SYCL doesn't support registering host memory, left here for reference
     // "ggml_backend_register_host_buffer"
