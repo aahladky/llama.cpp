@@ -2472,7 +2472,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             const bool has_sycl = !sycl_devices.empty();
             // Implemented sub-features (consumed by modelctl via these names):
             const bool moe_weight_transfer_cache = has_sycl;  // SYCL device slot cache + scheduler hook
-            const bool moe_hybrid_cpu_miss       = has_sycl;  // GPU-hit/CPU-miss hybrid execution (Phase 7)
+            const bool moe_hybrid_cpu_miss       = false;     // NOT IMPLEMENTED: CPU-miss execution does not
+                                                              // exist; misses fall back to the GPU path.
+                                                              // (moe-hybrid.cpp holds unreferenced stubs for
+                                                              // a future phase.)
             const bool moe_cache_metrics         = has_sycl;  // /metrics + stats JSON
             const bool moe_cache_prefill_policy  = has_sycl;  // prefill/decode phase admission policy
             const bool moe_cache_reset           = has_sycl;  // cache reset via API
@@ -2508,9 +2511,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             printf("    \"moe_cache_backend\": \"%s\",\n", has_sycl ? "SYCL" : "");
             printf("    \"moe_cache_min_batch\": 32,\n");
             printf("    \"moe_cache_supported_projections\": [\"gate\", \"up\", \"down\"],\n");
-            printf("    \"moe_hybrid_supported_archs\": [\"deepseek_v2\", \"deepseek_v3\", \"qwen3_moe\"],\n");
-            printf("    \"moe_hybrid_supported_quant\": [\"q4_0\", \"q4_k_m\", \"q8_0\", \"f16\"],\n");
-            printf("    \"moe_hybrid_can_overlap\": true\n");
+            // Hybrid constraints: hybrid CPU-miss execution is not implemented,
+            // so there are no supported archs/quants and no overlap. Fields stay
+            // present (schema stability) but report empty/false.
+            printf("    \"moe_hybrid_supported_archs\": [],\n");
+            printf("    \"moe_hybrid_supported_quant\": [],\n");
+            printf("    \"moe_hybrid_can_overlap\": false\n");
             printf("  },\n");
             // CLI flag names (canonical keys)
             printf("  \"cli\": {\n");

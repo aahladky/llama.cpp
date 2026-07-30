@@ -4543,8 +4543,15 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
 }
 
 // Global hybrid metrics (accumulated across all layers).
+// NOTE: true GPU-hit/CPU-miss hybrid execution is NOT implemented. Misses
+// under --moe-hybrid-mode execute on the same device mul_mat as everything
+// else, so they are counted as gpu_fallback_rows -- never as CPU misses.
+// hit_rows/miss_rows and the timing/bytes counters below stay at 0 until a
+// real CPU-miss path (see the unreferenced stubs in moe-hybrid.cpp) lands;
+// they are reported for stats-schema stability only.
 static std::atomic<int64_t> g_hybrid_hit_rows{0};
 static std::atomic<int64_t> g_hybrid_miss_rows{0};
+static std::atomic<int64_t> g_hybrid_gpu_fallback_rows{0};
 static std::atomic<double>  g_hybrid_cpu_miss_time_ms{0.0};
 static std::atomic<double>  g_hybrid_gpu_hit_time_ms{0.0};
 static std::atomic<double>  g_hybrid_merge_time_ms{0.0};
@@ -4566,9 +4573,12 @@ std::string moe_cache_collect_stats() {
             if (stats.front() == '{') stats = stats.substr(1);
             if (stats.back() == '}') stats.pop_back();
             result += "{\"device\":\"SYCL" + std::to_string(dev) + "\"," + stats;
-            // Append hybrid metrics.
+            // Append hybrid metrics.  cpu_miss_time_ms / h2d_bytes_avoided
+            // are always 0: no CPU-miss execution exists yet, so no CPU time
+            // is spent and no H2D bytes are avoided.
             result += ",\"hit_rows\":" + std::to_string(g_hybrid_hit_rows.load());
             result += ",\"miss_rows\":" + std::to_string(g_hybrid_miss_rows.load());
+            result += ",\"gpu_fallback_rows\":" + std::to_string(g_hybrid_gpu_fallback_rows.load());
             result += ",\"cpu_miss_time_ms\":" + std::to_string(g_hybrid_cpu_miss_time_ms.load());
             result += ",\"gpu_hit_time_ms\":" + std::to_string(g_hybrid_gpu_hit_time_ms.load());
             result += ",\"merge_time_ms\":" + std::to_string(g_hybrid_merge_time_ms.load());
@@ -4720,10 +4730,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
-        // Hybrid dispatch: for each expert, check if it's in the GPU cache.
-        // Cache hits execute on GPU (existing path). Cache misses execute
-        // on CPU using host-resident (mmap-backed) expert weights.
-        // The partition is built from the expert_row_counts array.
+        // Hybrid dispatch: true GPU-hit/CPU-miss execution is NOT
+        // implemented. Every expert -- hit or miss -- executes on the device
+        // via the same mul_mat below; cache misses fall back to GPU. The
+        // previous placeholder hit classification
+        // (lookup(layer=0, projection=0, proj_bytes=0)) could never return a
+        // real hit (the geometry guard in moe_expert_cache::lookup rejects
+        // proj_bytes=0) and has been removed. Rows run under
+        // --moe-hybrid-mode are therefore reported conservatively as
+        // gpu_fallback_rows, never as CPU misses. The unreferenced stubs in
+        // moe-hybrid.cpp (moe_build_partition / moe_cpu_miss_execute /
+        // moe_merge_outputs) are reserved for a future phase.
+        const bool hybrid_active = g_moe_hybrid_mode &&
+                                   ctx.moe_cache && ctx.moe_cache_enabled;
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             const int64_t num_src1_rows = expert_row_counts[i02];
 
@@ -4733,72 +4752,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
             const int64_t expert_row_offset = expert_row_offsets[i02];
 
-            // Check if this expert is in the GPU cache.
-            bool cache_hit = false;
-            if (ctx.moe_cache && ctx.moe_cache_enabled) {
-                // We don't have layer_id here; use 0 as a placeholder.
-                // The hook-based cache handles layer tracking per-tensor.
-                void * cached = ctx.moe_cache->lookup(
-                    /*layer=*/0, (int32_t)i02, /*projection=*/0, /*proj_bytes=*/0);
-                cache_hit = (cached != nullptr);
-            }
+            // GPU path: device mul_mat for all experts (hybrid "misses"
+            // included -- CPU-miss execution is not implemented).
+            src0_row.data = src0_original + i02*nb02;
 
-            if (cache_hit || !g_moe_hybrid_mode) {
-                // GPU path: existing mul_mat on device.
-                src0_row.data = src0_original + i02*nb02;
+            GGML_ASSERT(nb11 == sizeof(float)*ne10);
+            GGML_ASSERT(nb1 == sizeof(float)*ne0);
+            src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
+            src1_row.ne[1] = num_src1_rows;
 
-                GGML_ASSERT(nb11 == sizeof(float)*ne10);
-                GGML_ASSERT(nb1 == sizeof(float)*ne0);
-                src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
-                src1_row.ne[1] = num_src1_rows;
+            src1_row.nb[1] = nb11;
+            src1_row.nb[2] = num_src1_rows*nb11;
+            src1_row.nb[3] = num_src1_rows*nb11;
 
-                src1_row.nb[1] = nb11;
-                src1_row.nb[2] = num_src1_rows*nb11;
-                src1_row.nb[3] = num_src1_rows*nb11;
+            dst_row.data = dst_contiguous.get() + expert_row_offset*nb1;
+            dst_row.ne[1] = num_src1_rows;
+            dst_row.nb[1] = nb1;
+            dst_row.nb[2] = num_src1_rows*nb1;
+            dst_row.nb[3] = num_src1_rows*nb1;
 
-                dst_row.data = dst_contiguous.get() + expert_row_offset*nb1;
-                dst_row.ne[1] = num_src1_rows;
-                dst_row.nb[1] = nb1;
-                dst_row.nb[2] = num_src1_rows*nb1;
-                dst_row.nb[3] = num_src1_rows*nb1;
+            ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
 
-                ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
-
-                g_hybrid_hit_rows += num_src1_rows;
-            } else {
-                // CPU miss path: compute on host using mmap-backed weights.
-                // The expert weights in src0_original are on the device, but
-                // the host-side weights are available through the tensor's
-                // buffer. We use a simple CPU matmul for miss rows.
-                //
-                // For now, fall back to GPU computation with host-to-device
-                // copy (the existing transfer-cache behavior). True CPU
-                // miss execution requires host-side expert weight pointers
-                // which are not available in this loop.
-                //
-                // TODO: Refactor to pass host_src through to mul_mat_id
-                // for true hybrid CPU miss execution.
-
-                src0_row.data = src0_original + i02*nb02;
-
-                GGML_ASSERT(nb11 == sizeof(float)*ne10);
-                GGML_ASSERT(nb1 == sizeof(float)*ne0);
-                src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
-                src1_row.ne[1] = num_src1_rows;
-
-                src1_row.nb[1] = nb11;
-                src1_row.nb[2] = num_src1_rows*nb11;
-                src1_row.nb[3] = num_src1_rows*nb11;
-
-                dst_row.data = dst_contiguous.get() + expert_row_offset*nb1;
-                dst_row.ne[1] = num_src1_rows;
-                dst_row.nb[1] = nb1;
-                dst_row.nb[2] = num_src1_rows*nb1;
-                dst_row.nb[3] = num_src1_rows*nb1;
-
-                ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
-
-                g_hybrid_miss_rows += num_src1_rows;
+            if (hybrid_active) {
+                // GPU fallback, not a CPU miss: count separately so metrics
+                // never imply CPU execution that did not happen.
+                g_hybrid_gpu_fallback_rows += num_src1_rows;
             }
         }
 
