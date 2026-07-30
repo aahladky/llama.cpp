@@ -477,6 +477,14 @@ struct ggml_backend_sycl_context {
     }
 
     ggml_sycl_pool & host_pool() { return host_pool(device); }
+
+#ifdef GGML_MOE_EXPERT_CACHE
+    // MoE expert cache: persistent GPU slots for routed expert weights.
+    // One cache per device context; initialized lazily on first use.
+    struct moe_expert_cache * moe_cache = nullptr;
+    bool moe_cache_enabled = false;
+    bool moe_cache_init_failed = false;  // don't retry lazy init after failure
+#endif
 };
 
 // common device functions
