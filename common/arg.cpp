@@ -2745,9 +2745,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // runtime will -- reporting a hardcoded 32 while the env var
             // changes the real threshold made the field a lie.
             {
+                // Mirror the backend's full fallback chain (MOE-specific
+                // env, then the generic offload env, then 32): with only
+                // GGML_OP_OFFLOAD_MIN_BATCH set, the runtime threshold is
+                // that value, and reporting 32 here made the field a lie.
                 const char * moe_env = getenv("GGML_OP_OFFLOAD_MOE_MIN_BATCH");
-                const int moe_min_batch =
-                    (moe_env && atoi(moe_env) > 0) ? atoi(moe_env) : 32;
+                const char * gen_env = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+                int moe_min_batch = 32;
+                if (gen_env && atoi(gen_env) > 0) {
+                    moe_min_batch = atoi(gen_env);
+                }
+                if (moe_env && atoi(moe_env) > 0) {
+                    moe_min_batch = atoi(moe_env);
+                }
                 printf("    \"moe_cache_min_batch\": %d,\n", moe_min_batch);
             }
             printf("    \"moe_cache_supported_projections\": [\"gate\", \"up\", \"down\"],\n");

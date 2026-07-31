@@ -36,6 +36,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 #include <string>
 
@@ -268,6 +269,23 @@ public:
     // must never survive into the next graph run.
     hybrid_plan hybrid_take_plan(const void * cpy_base);
 
+    // Drop every pending plan.  Called (via the scheduler's abandon hook)
+    // when a graph is abandoned mid-compute: its ops will never take
+    // their plans, and a later tensor reusing a staged base must not
+    // inherit one and compute with the wrong host weights.
+    void hybrid_purge_plans();
+
+    // The staging hook refills this device base with raw GGUF-layout
+    // bytes on every graph run.  opt_for_reorder_id must never in-place
+    // reorder such a tensor: the reorder happens once but its flag is
+    // sticky, so from the second run on a fused kernel would read raw
+    // restaged bytes as if they were reordered.  The set is monotonic for
+    // the cache's lifetime -- clearing it (e.g. on reset()) could race a
+    // stage already in flight, and a false positive after address reuse
+    // only costs the reorder optimization, never correctness.
+    void note_staged_base(const void * cpy_base);
+    bool is_staged_base(const void * cpy_base) const;
+
     // Look up (layer, expert) for a specific projection (0=gate, 1=up, 2=down).
     // proj_bytes must match the learned projection size AND host_src must
     // match the pointer the projection was promoted from (tensor identity
@@ -314,6 +332,13 @@ public:
     // Set inference phase: true=prefill, false=decode.
     // During prefill, miss counts are not incremented.
     void set_phase(bool is_prefill);
+
+    // True while the current phase forbids admission (prefill with
+    // prefill-admission off).  A promotion declined for this reason is
+    // not cache pressure: the hybrid path must stage-and-execute
+    // normally, or a cold prompt turns into per-row scalar CPU GEMVs
+    // over every uncached expert.
+    bool admission_blocked_by_phase() const;
 
     void reset();
 
@@ -386,6 +411,8 @@ private:
     // draft contexts).
     mutable std::mutex m_hybrid_mutex;
     std::map<const void *, hybrid_plan> m_hybrid_plans;
+    // Device bases the hook has ever staged into (see note_staged_base).
+    std::set<const void *> m_staged_bases;
 };
 
 #endif // GGML_SYCL_MOE_CACHE_HPP

@@ -37,6 +37,13 @@ void ggml_backend_sched_set_moe_cache_hook(ggml_backend_sched_moe_cache_fn fn) {
     s_moe_cache_copy = fn;
 }
 
+// Called when compute_splits abandons a graph: pending hybrid plans from
+// its staged inputs must not survive to be taken by an unrelated tensor.
+static ggml_backend_sched_moe_cache_abandon_fn s_moe_cache_abandon = nullptr;
+void ggml_backend_sched_set_moe_cache_abandon_hook(ggml_backend_sched_moe_cache_abandon_fn fn) {
+    s_moe_cache_abandon = fn;
+}
+
 
 // backend buffer type
 
@@ -1721,6 +1728,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
+                if (s_moe_cache_abandon) s_moe_cache_abandon();
                 return ec;
             }
         } else {
@@ -1743,6 +1751,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
+                    if (s_moe_cache_abandon) s_moe_cache_abandon();
                     return ec;
                 }
 
@@ -1750,6 +1759,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_synchronize(split_backend);
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
+                    // The remaining nodes of this split are skipped; any
+                    // hybrid plan destined for one of them is now orphaned.
+                    if (s_moe_cache_abandon) s_moe_cache_abandon();
                     break;
                 }
 

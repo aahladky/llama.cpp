@@ -387,6 +387,14 @@ extern "C" {
                                                       int wtype);
     GGML_API void ggml_backend_sched_set_moe_cache_hook(ggml_backend_sched_moe_cache_fn fn);
 
+    // Called when the scheduler abandons a graph mid-compute (a split
+    // returned a non-success status).  Hybrid plans recorded while staging
+    // that graph's inputs will never be taken by their op; the backend
+    // must purge them so a later tensor reusing the same device address
+    // cannot inherit a stale plan and compute with the wrong host weights.
+    typedef void (*ggml_backend_sched_moe_cache_abandon_fn)(void);
+    GGML_API void ggml_backend_sched_set_moe_cache_abandon_hook(ggml_backend_sched_moe_cache_abandon_fn fn);
+
     //
     // Meta backend
     //

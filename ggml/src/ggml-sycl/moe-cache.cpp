@@ -433,6 +433,22 @@ moe_expert_cache::hybrid_plan moe_expert_cache::hybrid_take_plan(const void * cp
     return out;
 }
 
+void moe_expert_cache::hybrid_purge_plans() {
+    std::lock_guard<std::mutex> lock(m_hybrid_mutex);
+    m_hybrid_plans.clear();
+}
+
+void moe_expert_cache::note_staged_base(const void * cpy_base) {
+    if (!cpy_base) return;
+    std::lock_guard<std::mutex> lock(m_hybrid_mutex);
+    m_staged_bases.insert(cpy_base);
+}
+
+bool moe_expert_cache::is_staged_base(const void * cpy_base) const {
+    std::lock_guard<std::mutex> lock(m_hybrid_mutex);
+    return m_staged_bases.count(cpy_base) != 0;
+}
+
 bool moe_expert_cache::contains(int32_t layer, int32_t expert,
                                 int projection) const {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -458,6 +474,11 @@ bool moe_expert_cache::contains(int32_t layer, int32_t expert,
 void moe_expert_cache::set_phase(bool is_prefill) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_is_prefill = is_prefill;
+}
+
+bool moe_expert_cache::admission_blocked_by_phase() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_is_prefill && !m_prefill_admit;
 }
 
 void moe_expert_cache::reset() {
