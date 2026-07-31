@@ -4671,45 +4671,38 @@ static void mmid_counting_sort_rows(
 }
 
 #ifdef GGML_MOE_EXPERT_CACHE
-// Parse layer index from tensor name like "blk.5.ffn_gate_exps".
-// Returns -1 if not a MoE expert tensor.
-static int moe_cache_parse_layer(const char * name) {
-    if (!name) return -1;
-    if (strncmp(name, "blk.", 4) != 0) return -1;
-    if (!strstr(name, "exps")) return -1;
-    return atoi(name + 4);
-}
-
-// Determine projection type from tensor name: 0=gate, 1=up, 2=down, -1=unknown.
-static int moe_cache_parse_projection(const char * name) {
-    if (!name) return -1;
-    if (strstr(name, "gate_exps") || strstr(name, "gate_up_exps")) return 0;
-    if (strstr(name, "up_exps"))   return 1;
-    if (strstr(name, "down_exps")) return 2;
-    return -1;
-}
+// (Tensor-name parsing lives in moe-cache.cpp -- moe_cache_parse_layer /
+// moe_cache_parse_projection -- so the host-only tests can pin the naming
+// rules without a SYCL build.)
 
 // Lazy cache initialization: called from the scheduler hook on the first
 // cache-eligible expert copy.  The hook receives the original host tensor
 // name ("blk.N.ffn_*_exps"), so this fires even when ALL MoE layers are
 // CPU-resident and the SYCL graph never sees the weight tensors directly.
 //
-// The cache is a device-level resource (see g_moe_cache_registry above), so
-// two contexts on the same device (e.g. main + draft/MTP, each with its own
-// compute thread) can call this concurrently for the first time -- the
-// registry mutex serializes creation and reuse. NOTE: the shared cache is
-// initialized once, against whichever context reaches this function first,
-// and its GPU allocations + subsequent lookup/promote SYCL submissions are
-// tied to *that* context's queue (ctx.stream() at init time). Whether it is
-// safe for a second context's compute thread to submit through a cache
-// created against the first context's queue on the same device is an open
-// question this reading pass cannot settle -- it needs the real "two
-// contexts on one GPU" / "main plus draft/MTP context" correctness runs
-// (Task 0.6), not code inspection. Flagging rather than asserting either way.
+// The cache starts in LEARNING mode: no projection geometry is assumed
+// from the first tensor. The hook feeds it observations (projection index,
+// byte size, tensor origin) for one full graph pass; the pool is then
+// carved from the sizes real staged copies reported. Fused gate_up
+// layouts and unequal gate/up/down sizes therefore get correctly sized
+// regions, and projections that never appear get none.
+//
+// QUEUE OWNERSHIP (resolved, was an open question): the cache is a
+// device-level resource and so is its queue. ctx.stream() resolves to the
+// dpct per-device default in-order queue -- a singleton owned by the
+// device manager, not by any backend context, so it outlives every
+// context that shares the cache, and its in-order property serializes
+// promote copy-ins against lookup copy-outs no matter which context's
+// compute thread submitted them. That is the safety argument for main +
+// draft/MTP contexts sharing one cache. It holds ONLY while every sharer
+// uses that same queue, so adoption below fails closed on a context whose
+// stream is not the cache's queue instead of submitting through a second
+// queue with no ordering guarantee.
 static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
                                 const char * tensor_name,
                                 int32_t n_experts, size_t expert_bytes) {
     if (ctx.moe_cache || ctx.moe_cache_init_failed) return;  // already handled
+    GGML_UNUSED(expert_bytes);  // geometry is learned, not taken from one tensor
 
     int layer = moe_cache_parse_layer(tensor_name);
     if (layer < 0) return;
@@ -4726,6 +4719,17 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     if (ctx.moe_cache || ctx.moe_cache_init_failed) return;
 
     if (auto existing = g_moe_cache_registry[ctx.device].lock()) {
+        if (existing->queue() != (void *) ctx.stream()) {
+            // A second context with a non-default stream: submitting cache
+            // transfers through it would break the single-queue ordering
+            // contract, so this context runs without the cache.
+            fprintf(stderr, "moe_cache: device %d cache is bound to the device "
+                            "default queue but this context uses a different "
+                            "stream -- cache disabled for this context\n",
+                    ctx.device);
+            ctx.moe_cache_init_failed = true;
+            return;
+        }
         ctx.moe_cache_shared = existing;
         ctx.moe_cache = existing.get();
         ctx.moe_cache_enabled = true;
@@ -4737,20 +4741,12 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     cfg.budget_bytes = g_moe_cache_budget_bytes;
     cfg.n_layers = 256;  // generous upper bound; actual layers are sparse
     cfg.n_experts = n_experts;  // per-projection expert count
-    // Slot must hold all three projections (gate+up+down).
-    // All three are typically the same size; projections whose actual size
-    // differs from the init-time size are rejected by the geometry guards
-    // in lookup/promote_projection and simply never cached.
-    cfg.expert_bytes = expert_bytes * 3;
-    cfg.gate_bytes = expert_bytes;
-    cfg.up_bytes = expert_bytes;
-    cfg.down_bytes = expert_bytes;
     cfg.policy = (const char *)g_moe_cache_policy;
     cfg.admission_misses = (int)g_moe_cache_admission;
     cfg.prefill_admit = g_moe_cache_prefill_admit;
 
     auto cache = std::make_shared<moe_expert_cache>();
-    if (cache->init(cfg, ctx.stream())) {
+    if (cache->init_deferred(cfg, ctx.stream())) {
         // Adopt the phase the server already announced, rather than the
         // constructor's decode default.
         cache->set_phase(g_moe_cache_phase_is_prefill);
@@ -4758,9 +4754,9 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
         ctx.moe_cache = cache.get();
         ctx.moe_cache_enabled = true;
         g_moe_cache_registry[ctx.device] = cache;  // weak: doesn't extend lifetime
-        fprintf(stderr, "moe_cache: initialized on device %d, %d slots, %zu bytes budget\n",
-                ctx.device, cache->slot_count(),
-                cache->budget_bytes());
+        fprintf(stderr, "moe_cache: created on device %d, %zu bytes budget, "
+                        "learning projection geometry\n",
+                ctx.device, cache->budget_bytes());
     } else {
         fprintf(stderr, "moe_cache: init failed on device %d\n", ctx.device);
         ctx.moe_cache_init_failed = true;
@@ -4790,21 +4786,40 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     int proj  = moe_cache_parse_projection(tensor_name);
     if (layer < 0 || proj < 0) return false;
 
+    // Learning pass: feed the observation (projection size + tensor
+    // identity) and stage the copy normally. Caching starts once one full
+    // graph pass has shown every projection that exists.
+    if (ctx->moe_cache->is_learning()) {
+        const void * origin = host_src - (size_t)expert_id * expert_bytes;
+        ctx->moe_cache->observe_geometry(layer, proj, expert_bytes, origin);
+        return false;
+    }
+
+    // Every cache transfer below submits on the cache's own queue -- the
+    // device default in-order queue that adoption verified this context's
+    // stream() resolves to. Using the cache's accessor keeps the ownership
+    // unambiguous: the DEVICE owns the cache and its submissions, not
+    // whichever context happens to be computing.
+    queue_ptr q = (queue_ptr) ctx->moe_cache->queue();
+
     // MMQ kernels can read a few bytes past the end of the expert weights;
     // copy the padding tail from host (as the non-cache path in
     // ggml-backend.cpp does) so there are no NaNs in the padding.
     const size_t padding = expert_id < n_experts - 1
                          ? std::min(expert_bytes, (size_t)512) : 0;
 
-    // Check cache for this expert+projection.
-    void * cached = ctx->moe_cache->lookup(layer, expert_id, proj, expert_bytes);
+    // Check cache for this expert+projection. host_src doubles as the
+    // tensor identity: two models on one device reuse identical names, and
+    // the origin check stops one model being served the other's weights.
+    void * cached = ctx->moe_cache->lookup(layer, expert_id, proj, expert_bytes,
+                                           host_src);
     if (cached) {
         // Cache hit: copy from cache slot to dst (GPU-to-GPU).
         // dst is input_cpy->data + eid * expert_size.
         // The compute kernel will read from input_cpy as usual.
-        ctx->stream()->memcpy(dst, cached, expert_bytes);
+        q->memcpy(dst, cached, expert_bytes);
         if (padding > 0) {
-            ctx->stream()->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
+            q->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
         }
         return true;
     }
@@ -4814,9 +4829,9 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     void * slot = ctx->moe_cache->promote_projection(layer, expert_id, proj,
                                                       host_src, expert_bytes);
     if (slot) {
-        ctx->stream()->memcpy(dst, slot, expert_bytes);
+        q->memcpy(dst, slot, expert_bytes);
         if (padding > 0) {
-            ctx->stream()->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
+            q->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
         }
         return true;
     }

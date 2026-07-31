@@ -41,7 +41,24 @@
 #include <string>
 
 // Projections held per expert: gate, up, down.
+//
+// Fused layouts: architectures with a combined gate+up tensor
+// ("ffn_gate_up_exps") map it to projection 0; projection 1 then simply
+// never occurs for that model. The cache learns which projections exist
+// and how large each one is by OBSERVING real staged copies (see
+// observe_geometry) instead of assuming three equal components.
 #define MOE_CACHE_N_PROJECTIONS 3
+
+// Parse the layer index from a routed-expert tensor name like
+// "blk.5.ffn_gate_exps". Returns -1 for anything that is not a routed
+// MoE expert tensor (note: shared-expert tensors are named "*_shexp",
+// which does not contain "exps" and is correctly rejected).
+int moe_cache_parse_layer(const char * name);
+
+// Projection index from a tensor name: 0=gate (also fused gate_up),
+// 1=up, 2=down, -1=unknown. Lives here (not in the SYCL TU) so the
+// host-only tests can pin the naming rules per architecture.
+int moe_cache_parse_projection(const char * name);
 
 // Unique key for a cached expert.
 struct moe_expert_key {
@@ -75,6 +92,13 @@ struct moe_cache_slot {
     size_t gate_bytes   = 0;
     size_t up_bytes     = 0;
     size_t down_bytes   = 0;
+
+    // The host source each filled projection was promoted from. Two
+    // models loaded on one device share this cache and use identical
+    // tensor names ("blk.5.ffn_gate_exps"), so (layer, expert) alone
+    // would let model B's lookup be served model A's weights. The host
+    // pointer is the tensor identity that names cannot provide.
+    const void * proj_origin[MOE_CACHE_N_PROJECTIONS] = {nullptr, nullptr, nullptr};
 
     bool is_full() const { return filled_mask == 0x7; }  // gate+up+down
 };
@@ -160,13 +184,56 @@ public:
 
     // queue is a sycl::queue * (queue_ptr); see the note on the includes.
     // Null is only accepted together with cfg.host_only_for_testing.
+    //
+    // Queue ownership contract: the queue passed here must be the DEVICE's
+    // queue (in practice the dpct per-device default in-order queue, which
+    // every ggml-sycl context's stream() resolves to). It is owned by the
+    // device manager, not by any backend context, so it outlives every
+    // context that shares this cache; and because it is in-order, promote
+    // copy-ins and lookup copy-outs stay serialized no matter which
+    // context's compute thread submitted them. All cache device work --
+    // pool alloc, pool free, promote copies -- goes through THIS queue;
+    // callers must not submit cache transfers on a queue of their own.
     bool init(const moe_cache_config & cfg, void * queue);
 
+    // Deferred variant: accepts a config with NO projection geometry.
+    // The cache starts in learning mode (is_learning() true); feed it
+    // observe_geometry() calls until it reports ready, at which point the
+    // pool is allocated from the OBSERVED per-projection sizes. This is
+    // how fused gate_up layouts and unequal gate/up/down sizes get
+    // correctly sized regions instead of first-tensor guesses.
+    bool init_deferred(const moe_cache_config & cfg, void * queue);
+
+    // Record one staged-copy observation while learning. `origin` is the
+    // host base address of the staged tensor (host_src minus the expert
+    // offset): revisiting an origin that was already staged and left
+    // means the graph has wrapped into a second pass, so every projection
+    // that exists has been seen and geometry can be finalized. Returns
+    // true once the cache has just become (or already is) ready.
+    //
+    // If the scheduler stages one tensor for several splits in a single
+    // pass, finalization can fire before the later projections appear;
+    // those projections are then simply never cached (fail-safe, not
+    // fail-wrong).
+    bool observe_geometry(int32_t layer, int projection, size_t proj_bytes,
+                          const void * origin);
+
+    // True while in deferred mode with geometry not yet finalized.
+    bool is_learning() const;
+
+    // The device queue every cache submission uses (see the init contract).
+    void * queue() const { return m_queue; }
+
     // Look up (layer, expert) for a specific projection (0=gate, 1=up, 2=down).
-    // proj_bytes must match the init-time projection size, otherwise the
-    // request is treated as not cacheable.  Returns a device pointer to the
-    // projection region within the slot on hit, nullptr on miss.
-    void * lookup(int32_t layer, int32_t expert, int projection, size_t proj_bytes);
+    // proj_bytes must match the learned projection size AND host_src must
+    // match the pointer the projection was promoted from (tensor identity
+    // -- two models on one device reuse the same names). Returns a device
+    // pointer to the projection region within the slot on hit, nullptr on
+    // miss. host_src=nullptr skips the identity check; the production hook
+    // always passes it, the default exists for policy tests that have no
+    // stable tensor addresses.
+    void * lookup(int32_t layer, int32_t expert, int projection, size_t proj_bytes,
+                  const void * host_src = nullptr);
 
     // Is this projection resident right now?  Task G2's partition builder
     // needs to ask without changing the answer: lookup() counts a hit or a
@@ -190,9 +257,11 @@ public:
     // Promote one projection of an expert into the cache.
     // If the expert isn't cached yet, allocates a slot and copies this
     // projection.  If the expert is cached but this projection is missing,
-    // fills it.  proj_bytes must match the init-time projection size,
-    // otherwise no copy is made.  Returns a device pointer to the
-    // projection region within the slot.
+    // fills it.  proj_bytes must match the learned projection size,
+    // otherwise no copy is made.  The slot records host_src as the
+    // projection's origin; lookups only serve requests with the same
+    // origin.  Returns a device pointer to the projection region within
+    // the slot.
     void * promote_projection(int32_t layer, int32_t expert,
                                int projection, const void * host_src, size_t proj_bytes);
 
@@ -218,6 +287,9 @@ private:
     int  evict_slru();
     void touch(int slot_id);
     void promote_to_protected(int slot_id);
+    // Carve the slot pool from m_geom_bytes. Caller holds m_mutex (or is
+    // in single-threaded init).
+    bool finalize_geometry_locked();
 
     // Index into m_miss_counts for one (layer, expert, projection).
     // Returns -1 when any component is out of range.
@@ -243,9 +315,16 @@ private:
     int m_n_layers = 0;
     int m_n_experts = 0;
     size_t m_expert_bytes = 0;
-    size_t m_gate_bytes = 0;
-    size_t m_up_bytes   = 0;
-    size_t m_down_bytes = 0;
+    // Learned (or configured) byte size per projection index. 0 means
+    // "this projection does not exist for this model" (fused layouts have
+    // no separate up), and requests against it are rejected.
+    size_t m_geom_bytes[MOE_CACHE_N_PROJECTIONS] = {0, 0, 0};
+    // Geometry-learning state (deferred init). m_obs_completed holds the
+    // origins whose staging we have seen finish (we moved on to another
+    // tensor); revisiting one of them means a second pass has begun.
+    bool m_deferred = false;
+    const void * m_obs_current_origin = nullptr;
+    std::vector<const void *> m_obs_completed;
     int m_admission_misses = 1;
     bool m_prefill_admit = false;
     bool m_is_prefill = false;

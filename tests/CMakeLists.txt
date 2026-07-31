@@ -350,6 +350,9 @@ add_executable(test-moe-cache
     test-moe-cache.cpp
     ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl/moe-cache.cpp)
 target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+# The concurrent-lifecycle case runs real std::threads.
+find_package(Threads REQUIRED)
+target_link_libraries(test-moe-cache PRIVATE Threads::Threads)
 add_test(NAME test-moe-cache COMMAND test-moe-cache)
 set_property(TEST test-moe-cache PROPERTY LABELS main)
 

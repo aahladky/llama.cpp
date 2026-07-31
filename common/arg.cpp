@@ -2735,11 +2735,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // Constraints
             printf("  \"constraints\": {\n");
             printf("    \"moe_cache_backend\": \"%s\",\n", cache_implemented ? cache_backend_name.c_str() : "");
-            // The default batch at which the cache's hook fires. When
-            // moe_offload_threshold_control is true this is overridable per
-            // op type via GGML_OP_OFFLOAD_MOE_MIN_BATCH, so treat it as the
-            // default rather than as a fixed property of the build.
-            printf("    \"moe_cache_min_batch\": 32,\n");
+            // The batch at which routed MoE ops offload. The probe runs
+            // under the actual launch environment (modelctl passes it), so
+            // honour GGML_OP_OFFLOAD_MOE_MIN_BATCH here the same way the
+            // runtime will -- reporting a hardcoded 32 while the env var
+            // changes the real threshold made the field a lie.
+            {
+                const char * moe_env = getenv("GGML_OP_OFFLOAD_MOE_MIN_BATCH");
+                const int moe_min_batch =
+                    (moe_env && atoi(moe_env) > 0) ? atoi(moe_env) : 32;
+                printf("    \"moe_cache_min_batch\": %d,\n", moe_min_batch);
+            }
             printf("    \"moe_cache_supported_projections\": [\"gate\", \"up\", \"down\"],\n");
             // Hybrid constraints: hybrid CPU-miss execution is not implemented,
             // so there are no supported archs/quants and no overlap. Fields stay

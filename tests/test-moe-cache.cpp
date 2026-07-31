@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 // The policy lives in moe-cache.cpp and links here; the device operations
@@ -426,6 +427,212 @@ static void test_metrics_distinguish_hits_from_fallbacks() {
     CHECK(json.find("cpu_expert_calls") == std::string::npos);
 }
 
+// ---------------------------------------------------------------------
+// Tensor-name parsing (the naming rules the hook lives by)
+// ---------------------------------------------------------------------
+
+static void test_parse_recognizes_separate_expert_tensors() {
+    CASE("parse: separate gate/up/down expert tensors");
+    CHECK_EQ(moe_cache_parse_layer("blk.5.ffn_gate_exps.weight"), 5);
+    CHECK_EQ(moe_cache_parse_layer("blk.17.ffn_down_exps.weight"), 17);
+    CHECK_EQ(moe_cache_parse_projection("blk.5.ffn_gate_exps.weight"), GATE);
+    CHECK_EQ(moe_cache_parse_projection("blk.5.ffn_up_exps.weight"), UP);
+    CHECK_EQ(moe_cache_parse_projection("blk.5.ffn_down_exps.weight"), DOWN);
+}
+
+static void test_parse_maps_fused_gate_up_to_projection_zero() {
+    // Fused layouts have no separate up tensor; the combined weights ride
+    // in projection 0 and projection 1 simply never occurs.
+    CASE("parse: fused gate_up maps to projection 0");
+    CHECK_EQ(moe_cache_parse_layer("blk.3.ffn_gate_up_exps.weight"), 3);
+    CHECK_EQ(moe_cache_parse_projection("blk.3.ffn_gate_up_exps.weight"), GATE);
+}
+
+static void test_parse_rejects_non_expert_tensors() {
+    CASE("parse: shared-expert and non-expert tensors are rejected");
+    // Shared experts ("shexp") are dense weights placed like any other --
+    // caching them per routed expert would be wrong.
+    CHECK_EQ(moe_cache_parse_layer("blk.5.ffn_gate_shexp.weight"), -1);
+    CHECK_EQ(moe_cache_parse_layer("blk.5.attn_q.weight"), -1);
+    CHECK_EQ(moe_cache_parse_layer("output.weight"), -1);
+    CHECK_EQ(moe_cache_parse_layer(nullptr), -1);
+    CHECK_EQ(moe_cache_parse_projection("blk.5.attn_q.weight"), -1);
+    CHECK_EQ(moe_cache_parse_projection(nullptr), -1);
+}
+
+// ---------------------------------------------------------------------
+// Learned geometry (deferred init)
+// ---------------------------------------------------------------------
+
+static moe_cache_config deferred_config(size_t budget) {
+    moe_cache_config cfg;
+    cfg.device_id = 0;
+    cfg.n_layers  = 4;
+    cfg.n_experts = 8;
+    cfg.budget_bytes = budget;
+    cfg.policy = "lru";
+    cfg.admission_misses = 1;
+    cfg.host_only_for_testing = true;
+    return cfg;
+}
+
+// Distinct stable origins standing in for tensor base addresses.
+static char g_origin_tag[16];
+static const void * origin(int i) { return g_origin_tag + i; }
+
+static void test_learned_geometry_honours_unequal_sizes() {
+    // The bug this exists for: geometry used to be copied from whichever
+    // tensor the hook saw first, so gate=128/up=256/down=512 became
+    // 128/128/128 and two of three projections were never cacheable.
+    CASE("learned geometry: unequal gate/up/down sizes from observation");
+    moe_expert_cache cache;
+    CHECK(cache.init_deferred(deferred_config((128 + 256 + 512) * 4), nullptr));
+    CHECK(cache.is_learning());
+
+    // Nothing caches while learning.
+    std::vector<uint8_t> g(128, 0xA1), u(256, 0xB2), d(512, 0xC3);
+    cache.record_miss(0, 0, GATE);
+    CHECK(cache.promote_projection(0, 0, GATE, g.data(), 128) == nullptr);
+
+    // One full pass: three tensors observed, then the first one revisits.
+    CHECK(!cache.observe_geometry(0, GATE, 128, origin(0)));
+    CHECK(!cache.observe_geometry(0, UP,   256, origin(1)));
+    CHECK(!cache.observe_geometry(0, DOWN, 512, origin(2)));
+    CHECK(cache.observe_geometry(0, GATE, 128, origin(0)));  // wraparound
+    CHECK(!cache.is_learning());
+    CHECK(cache.is_initialized());
+
+    // Each projection now has a correctly sized region.
+    cache.record_miss(0, 0, GATE);
+    CHECK(cache.promote_projection(0, 0, GATE, g.data(), 128) != nullptr);
+    cache.record_miss(0, 0, UP);
+    CHECK(cache.promote_projection(0, 0, UP, u.data(), 256) != nullptr);
+    cache.record_miss(0, 0, DOWN);
+    CHECK(cache.promote_projection(0, 0, DOWN, d.data(), 512) != nullptr);
+    CHECK_EQ(memcmp(cache.lookup(0, 0, DOWN, 512), d.data(), 512), 0);
+}
+
+static void test_learned_geometry_supports_fused_gate_up() {
+    // A fused model has projections 0 (gate_up, double width) and 2 (down)
+    // only. The old first-tensor guess sized all three regions to the
+    // fused width and the guard then rejected down forever.
+    CASE("learned geometry: fused gate_up layout (no separate up)");
+    moe_expert_cache cache;
+    CHECK(cache.init_deferred(deferred_config((1024 + 512) * 4), nullptr));
+
+    std::vector<uint8_t> gu(1024, 0x11), d(512, 0x22);
+    CHECK(!cache.observe_geometry(0, GATE, 1024, origin(0)));
+    CHECK(!cache.observe_geometry(0, DOWN, 512,  origin(1)));
+    // Wraparound on the first tensor finalizes.
+    CHECK(cache.observe_geometry(0, GATE, 1024, origin(0)));
+    CHECK(!cache.is_learning());
+
+    cache.record_miss(0, 0, GATE);
+    CHECK(cache.promote_projection(0, 0, GATE, gu.data(), 1024) != nullptr);
+    cache.record_miss(0, 0, DOWN);
+    CHECK(cache.promote_projection(0, 0, DOWN, d.data(), 512) != nullptr);
+    // The projection that does not exist for this model is never served.
+    CHECK(cache.lookup(0, 0, UP, 1024) == nullptr);
+    CHECK(cache.lookup(0, 0, UP, 0) == nullptr);
+}
+
+static void test_learned_geometry_rejects_later_mismatches() {
+    // Mixed quantization across layers: a layer whose projection size
+    // differs from the learned one is simply not cached (partial
+    // cacheability), never over-read.
+    CASE("learned geometry: mismatched layer sizes are uncacheable, not corrupting");
+    moe_expert_cache cache;
+    CHECK(cache.init_deferred(deferred_config(256 * 3 * 4), nullptr));
+    CHECK(!cache.observe_geometry(0, GATE, 256, origin(0)));
+    CHECK(!cache.observe_geometry(0, UP,   256, origin(1)));
+    CHECK(!cache.observe_geometry(0, DOWN, 256, origin(2)));
+    CHECK(cache.observe_geometry(0, GATE, 256, origin(0)));
+
+    std::vector<uint8_t> bigger(512, 0x99);
+    cache.record_miss(1, 0, GATE);
+    CHECK(cache.promote_projection(1, 0, GATE, bigger.data(), 512) == nullptr);
+    CHECK(cache.lookup(1, 0, GATE, 512) == nullptr);
+    CHECK_EQ(cache.slots_used(), 0);
+}
+
+static void test_no_observations_never_initializes() {
+    CASE("learned geometry: zero observations means no pool, fail closed");
+    moe_expert_cache cache;
+    CHECK(cache.init_deferred(deferred_config(1 << 20), nullptr));
+    CHECK(cache.is_learning());
+    // Lookups and promotes are inert until geometry exists.
+    CHECK(cache.lookup(0, 0, GATE, 256) == nullptr);
+    std::vector<uint8_t> w(256, 0x42);
+    cache.record_miss(0, 0, GATE);
+    CHECK(cache.promote_projection(0, 0, GATE, w.data(), 256) == nullptr);
+}
+
+// ---------------------------------------------------------------------
+// Tensor identity (two models sharing one device cache)
+// ---------------------------------------------------------------------
+
+static void test_same_key_different_model_is_a_miss() {
+    // Two models loaded on one device (main + draft/MTP) share the cache
+    // and use identical tensor names. blk.0 expert 0 of model B must not
+    // be served model A's weights just because the names collide.
+    CASE("tensor identity: same (layer,expert,proj) from another model misses");
+    moe_expert_cache cache;
+    CHECK(cache.init(make_config(4, /*admission=*/1), nullptr));
+
+    std::vector<uint8_t> model_a(PROJ_BYTES, 0xAA);
+    std::vector<uint8_t> model_b(PROJ_BYTES, 0xBB);
+
+    cache.record_miss(0, 0, GATE);
+    CHECK(cache.promote_projection(0, 0, GATE, model_a.data(), PROJ_BYTES) != nullptr);
+
+    // Model A's own lookup hits.
+    void * hit = cache.lookup(0, 0, GATE, PROJ_BYTES, model_a.data());
+    CHECK(hit != nullptr);
+    CHECK_EQ(memcmp(hit, model_a.data(), PROJ_BYTES), 0);
+
+    // Model B presents the same key with a different tensor: miss, never
+    // model A's bytes.
+    CHECK(cache.lookup(0, 0, GATE, PROJ_BYTES, model_b.data()) == nullptr);
+}
+
+// ---------------------------------------------------------------------
+// Concurrent lifecycle (two compute threads + a metrics/reset thread)
+// ---------------------------------------------------------------------
+
+static void test_concurrent_use_and_reset_survive() {
+    // Main + draft contexts each have a compute thread, and the server's
+    // HTTP threads call stats/reset during unload. This cannot prove the
+    // absence of races, but it exercises every locked path concurrently
+    // and fails loudly (crash/deadlock) if the locking regresses.
+    CASE("concurrency: two users plus stats/reset run to completion");
+    moe_expert_cache cache;
+    CHECK(cache.init(make_config(8, /*admission=*/1), nullptr));
+
+    auto user = [&cache](int layer_base) {
+        for (int round = 0; round < 200; round++) {
+            for (int e = 0; e < 8; e++) {
+                use_expert(cache, layer_base + (round % 2), e,
+                           (uint8_t)(e * 7 + 1));
+            }
+        }
+    };
+    std::thread a(user, 0);
+    std::thread b(user, 2);
+    std::thread c([&cache]() {
+        for (int i = 0; i < 100; i++) {
+            (void)cache.stats_json();
+            (void)cache.slots_used();
+            if (i % 25 == 24) cache.reset();
+        }
+    });
+    a.join();
+    b.join();
+    c.join();
+    // Still consistent and usable afterwards.
+    use_expert(cache, 0, 0, 0x5C);
+    CHECK(cache.lookup(0, 0, GATE, PROJ_BYTES) != nullptr);
+}
+
 int main() {
     test_admission_threshold_one();
     test_admission_threshold_two_needs_a_second_use();
@@ -448,6 +655,18 @@ int main() {
     test_reset_clears_everything();
     test_out_of_range_keys_are_ignored();
     test_metrics_distinguish_hits_from_fallbacks();
+
+    test_parse_recognizes_separate_expert_tensors();
+    test_parse_maps_fused_gate_up_to_projection_zero();
+    test_parse_rejects_non_expert_tensors();
+
+    test_learned_geometry_honours_unequal_sizes();
+    test_learned_geometry_supports_fused_gate_up();
+    test_learned_geometry_rejects_later_mismatches();
+    test_no_observations_never_initializes();
+
+    test_same_key_different_model_is_a_miss();
+    test_concurrent_use_and_reset_survive();
 
     if (g_failures) {
         fprintf(stderr, "\n%d check(s) failed\n", g_failures);
