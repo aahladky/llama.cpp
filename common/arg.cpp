@@ -2676,13 +2676,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // cells skip instead of measuring a variable nothing reads.
             const bool moe_offload_threshold_control = cache_implemented;
 
+            // Build provenance, from CMake-generated build metadata --
+            // support bundles and the modelctl UI must be able to answer
+            // "which exact build is this" from the binary itself, not
+            // from a repository manifest that can drift from it.
+            std::string backends_json = "[";
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                if (i > 0) {
+                    backends_json += ",";
+                }
+                backends_json += std::string("\"") +
+                    ggml_backend_reg_name(ggml_backend_reg_get(i)) + "\"";
+            }
+            backends_json += "]";
+
             printf("{\n");
             printf("  \"schema\": 2,\n");
             printf("  \"backend\": \"llama.cpp\",\n");
             printf("  \"build\": {\n");
-            printf("    \"commit\": \"custom-moe-cache\",\n");
-            printf("    \"compiler\": \"\",\n");
+            printf("    \"commit\": \"%s\",\n", llama_commit());
+            printf("    \"number\": %d,\n", llama_build_number());
+            printf("    \"compiler\": \"%s\",\n", llama_compiler());
+            printf("    \"target\": \"%s\",\n", llama_build_target());
+#ifdef MODELCTL_BUILD_TYPE
+            printf("    \"build_type\": \"%s\",\n", MODELCTL_BUILD_TYPE);
+#else
+            printf("    \"build_type\": \"\",\n");
+#endif
+            // Enumerated from the live backend registry, so a dlopened
+            // plugin backend counts the same as a linked one.
+            printf("    \"backends\": %s,\n", backends_json.c_str());
+            // From the GGML_BACKEND_DL CMake option rather than guessed:
+            // the previous hardcoded false was wrong for every DL build.
+#if defined(MODELCTL_DYNAMIC_BACKENDS) && MODELCTL_DYNAMIC_BACKENDS
+            printf("    \"dynamic_backends\": true\n");
+#else
             printf("    \"dynamic_backends\": false\n");
+#endif
             printf("  },\n");
             // Devices with per-device features
             printf("  \"devices\": [\n");

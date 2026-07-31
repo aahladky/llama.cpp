@@ -133,6 +133,15 @@ if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
 endif()
 
+# Build provenance for the modelctl capability report (--modelctl-capabilities):
+# the binary itself must be able to say how it was built. CMAKE_BUILD_TYPE and
+# GGML_BACKEND_DL are configure-time facts that are otherwise invisible to the
+# compiled code -- the report used to hardcode dynamic_backends=false, which
+# was wrong for every GGML_BACKEND_DL=ON build.
+target_compile_definitions(${TARGET} PRIVATE
+    MODELCTL_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+    MODELCTL_DYNAMIC_BACKENDS=$<BOOL:${GGML_BACKEND_DL}>)
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
