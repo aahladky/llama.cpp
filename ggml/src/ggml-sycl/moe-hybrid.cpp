@@ -1,109 +1,117 @@
-// Hybrid MoE Execution — implementation.
+// Hybrid MoE Execution — partition representation (roadmap Task G2).
+//
+// No SYCL here: this is the partition and merge logic, and keeping it
+// plain C++ is what lets tests/test-moe-hybrid.cpp run without a GPU.
+// Execution (G3/G4) and the real merge into device buffers (G5) are not
+// implemented; see modelctl/docs/moe-hybrid-execution-design.md §4.
 
 #include "moe-hybrid.hpp"
+
+#include <algorithm>
 #include <cstring>
-#include <chrono>
+
+int moe_hybrid_partition::n_destination_rows() const {
+    if (contributions.empty()) {
+        return 0;
+    }
+    int32_t max_row = -1;
+    for (const auto & c : contributions) {
+        max_row = std::max(max_row, c.original_row);
+    }
+    if (max_row < 0) {
+        return 0;
+    }
+    // Count distinct rows rather than assuming they are dense: a partition
+    // built for one projection of a sparse batch need not cover every row.
+    std::vector<bool> seen((size_t)max_row + 1, false);
+    int n = 0;
+    for (const auto & c : contributions) {
+        if (c.original_row >= 0 && !seen[(size_t)c.original_row]) {
+            seen[(size_t)c.original_row] = true;
+            n++;
+        }
+    }
+    return n;
+}
 
 moe_hybrid_partition moe_build_partition(
     const int32_t * expert_ids,
-    int64_t n_rows,
-    int32_t layer_id,
-    moe_expert_cache * cache)
+    const float *   routing_weights,
+    const int32_t * original_rows,
+    int64_t         n_rows,
+    int32_t         layer_id,
+    int             projection,
+    const moe_expert_cache * cache)
 {
     moe_hybrid_partition part;
-    part.gpu_hits.reserve(n_rows);
-    part.cpu_misses.reserve(n_rows);
-
-    if (!cache || !cache->is_initialized()) {
-        // No cache: everything is a miss.
-        for (int64_t i = 0; i < n_rows; i++) {
-            part.cpu_misses.push_back({(int32_t)i, (int32_t)i, expert_ids[i]});
-        }
+    if (!expert_ids || n_rows <= 0) {
         return part;
     }
+    part.contributions.reserve((size_t)n_rows);
 
     for (int64_t i = 0; i < n_rows; i++) {
-        int32_t expert = expert_ids[i];
-        // Check if this expert is fully cached (gate+up+down).
-        // We check gate projection (projection 0) as a proxy — if gate
-        // is cached, the slot exists and will be filled for other projections.
-        void * cached = cache->lookup(layer_id, expert, /*projection=*/0, /*proj_bytes=*/0);
-        if (cached) {
-            part.gpu_hits.push_back({(int32_t)i, (int32_t)i, expert});
-        } else {
-            part.cpu_misses.push_back({(int32_t)i, (int32_t)i, expert});
-        }
-    }
+        moe_contribution c;
+        c.contiguous_row = (int32_t)i;
+        c.original_row   = original_rows ? original_rows[i] : (int32_t)i;
+        c.expert_id      = expert_ids[i];
+        c.routing_weight = routing_weights ? routing_weights[i] : 1.0f;
+        c.projection     = projection;
 
+        // No cache, or the projection is not resident, means the CPU tier
+        // computes it. contains() is used rather than lookup() so that
+        // building a partition does not count hits, move SLRU recency or
+        // clear admission progress -- classifying work must not change
+        // what is cached.
+        const bool resident = cache && cache->contains(layer_id, c.expert_id,
+                                                       projection);
+        c.tier = resident ? MOE_TIER_GPU_HIT : MOE_TIER_CPU_MISS;
+        part.contributions.push_back(c);
+    }
     return part;
 }
 
-void moe_hybrid_context::init(int64_t ne10, int64_t ne0, int max_miss_rows,
-                              size_t expert_bytes) {
-    cpu_src1.resize(max_miss_rows * ne10);
-    cpu_dst.resize(max_miss_rows * ne0);
-    cpu_expert.resize(expert_bytes / sizeof(float));
-    initialized = true;
-}
-
-void moe_cpu_miss_execute(
-    const void * src0_host,
-    const float * src1_host,
-    float * dst_host,
+void moe_merge_contributions(
     const moe_hybrid_partition & partition,
-    size_t expert_stride,
-    int64_t ne0,
-    int64_t ne10,
-    int32_t n_experts)
+    const float * tier_outputs,
+    float *       dst,
+    int64_t       ne0,
+    bool          zero_dst)
 {
-    if (!partition.has_misses()) return;
-
-    for (const auto & entry : partition.cpu_misses) {
-        int32_t expert = entry.expert_id;
-        if (expert < 0 || expert >= n_experts) continue;
-
-        const float * expert_weights = (const float *)(
-            (const char *)src0_host + expert * expert_stride);
-        const float * activation = src1_host + entry.contiguous_row * ne10;
-        float * output = dst_host + entry.contiguous_row * ne0;
-
-        // Simple CPU matmul: output = activation @ expert_weights^T
-        // expert_weights is [ne0 x ne10] (row-major)
-        // activation is [ne10]
-        // output is [ne0]
-        for (int64_t o = 0; o < ne0; o++) {
-            float sum = 0.0f;
-            for (int64_t i = 0; i < ne10; i++) {
-                sum += activation[i] * expert_weights[o * ne10 + i];
+    if (!dst || ne0 <= 0) {
+        return;
+    }
+    if (zero_dst) {
+        const int rows = partition.n_destination_rows();
+        if (rows > 0) {
+            // Rows are addressed by original_row, so the span to clear is
+            // bounded by the largest one, not by the count.
+            int32_t max_row = -1;
+            for (const auto & c : partition.contributions) {
+                max_row = std::max(max_row, c.original_row);
             }
-            output[o] = sum;
+            if (max_row >= 0) {
+                std::memset(dst, 0, (size_t)(max_row + 1) * (size_t)ne0
+                            * sizeof(float));
+            }
         }
     }
-}
-
-void moe_merge_outputs(
-    const float * gpu_dst,
-    const float * cpu_dst,
-    const moe_hybrid_partition & partition,
-    float * dst,
-    int64_t ne0,
-    size_t row_bytes,
-    void * stream)
-{
-    // Copy GPU hit results to final dst.
-    for (const auto & entry : partition.gpu_hits) {
-        // gpu_dst is indexed by contiguous row within the hit subset.
-        // We need to find which index in gpu_hits this entry is.
-        // For simplicity, we use the contiguous_row as offset into gpu_dst.
-        const float * src = gpu_dst + entry.contiguous_row * ne0;
-        float * d = dst + entry.original_row * ne0;
-        memcpy(d, src, row_bytes);
+    if (!tier_outputs) {
+        return;
     }
 
-    // Copy CPU miss results to final dst.
-    for (const auto & entry : partition.cpu_misses) {
-        const float * src = cpu_dst + entry.contiguous_row * ne0;
-        float * d = dst + entry.original_row * ne0;
-        memcpy(d, src, row_bytes);
+    // Fixed order: the partition's own. Accumulating in completion order
+    // would make the same input produce different output run to run, since
+    // float addition is not associative (design §3.6).
+    for (size_t k = 0; k < partition.contributions.size(); k++) {
+        const moe_contribution & c = partition.contributions[k];
+        if (c.original_row < 0) {
+            continue;
+        }
+        const float * src = tier_outputs + k * (size_t)ne0;
+        float * out = dst + (size_t)c.original_row * (size_t)ne0;
+        const float w = c.routing_weight;
+        for (int64_t j = 0; j < ne0; j++) {
+            out[j] += w * src[j];
+        }
     }
 }

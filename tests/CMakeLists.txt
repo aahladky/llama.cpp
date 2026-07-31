@@ -352,3 +352,14 @@ add_executable(test-moe-cache
 target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 add_test(NAME test-moe-cache COMMAND test-moe-cache)
 set_property(TEST test-moe-cache PROPERTY LABELS main)
+
+# Hybrid MoE partition tests (roadmap Task G2). Same host-only shape: the
+# partition and merge are plain bookkeeping and need no GPU. Execution
+# (G3/G4) does not exist yet and nothing here pretends to test it.
+add_executable(test-moe-hybrid
+    test-moe-hybrid.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl/moe-hybrid.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl/moe-cache.cpp)
+target_include_directories(test-moe-hybrid PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+add_test(NAME test-moe-hybrid COMMAND test-moe-hybrid)
+set_property(TEST test-moe-hybrid PROPERTY LABELS main)

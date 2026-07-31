@@ -274,6 +274,28 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
     return (char *)slot.device_ptr + offset;
 }
 
+bool moe_expert_cache::contains(int32_t layer, int32_t expert,
+                                int projection) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_initialized || layer < 0 || layer >= m_n_layers ||
+        expert < 0 || expert >= m_n_experts ||
+        projection < 0 || projection >= MOE_CACHE_N_PROJECTIONS) {
+        return false;
+    }
+    const int slot_id = m_layer_index[layer].expert_to_slot[expert];
+    if (slot_id < 0 || slot_id >= (int)m_slots.size()) {
+        return false;
+    }
+    const moe_cache_slot & s = m_slots[slot_id];
+    if (!s.occupied || s.key.layer != layer || s.key.expert != expert) {
+        return false;
+    }
+    // Residency is per projection: a slot can hold gate while up and down
+    // are still absent, and a partition that treated the expert as one
+    // unit would send two thirds of the work to the wrong tier.
+    return (s.filled_mask & (1u << projection)) != 0;
+}
+
 void moe_expert_cache::set_phase(bool is_prefill) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_is_prefill = is_prefill;

@@ -168,6 +168,13 @@ public:
     // projection region within the slot on hit, nullptr on miss.
     void * lookup(int32_t layer, int32_t expert, int projection, size_t proj_bytes);
 
+    // Is this projection resident right now?  Task G2's partition builder
+    // needs to ask without changing the answer: lookup() counts a hit or a
+    // miss, updates SLRU recency and clears admission progress, all of
+    // which are correct for the transfer-cache path and wrong for
+    // classifying rows. This touches nothing.
+    bool contains(int32_t layer, int32_t expert, int projection) const;
+
     // Record a miss for admission tracking.  During prefill, miss counts
     // are NOT incremented (prefill protection).
     //

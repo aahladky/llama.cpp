@@ -1,96 +1,109 @@
-// Hybrid MoE Execution — partition builder and dispatch.
+// Hybrid MoE Execution — partition representation (roadmap Task G2).
 //
-// Splits expert computation into GPU cache hits and CPU misses.
-// GPU hits use persistent cached expert tensors.
-// CPU misses use mmap-backed host expert weights.
-// Outputs are merged per-token.
+// A routed MoE output is the weighted sum of n_expert_used expert outputs
+// per token. The partition therefore is NOT a two-way split of rows: it is
+// a list of *contributions*, each one expert's share of one token's
+// output, tagged with the tier that will compute it.
+//
+// The earlier version of this file modelled it as a row split and merged
+// with memcpy into dst[original_row], so with n_expert_used = 2 the second
+// expert silently overwrote the first, and the routing coefficient was
+// never represented at all. See modelctl/docs/moe-hybrid-execution-design.md
+// §0 for that and the other defects this replaces.
+//
+// This header is deliberately free of SYCL, like moe-cache.hpp, so the
+// partition logic can be unit-tested on any machine (Task F8's pattern).
 
 #ifndef GGML_SYCL_MOE_HYBRID_HPP
 #define GGML_SYCL_MOE_HYBRID_HPP
 
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 #include "moe-cache.hpp"
 
-// Partition of (token_row, expert) pairs into GPU hits and CPU misses.
-struct moe_hybrid_partition {
-    // Indices into the contiguous routed-row buffer.
-    // These are NOT original token indices — they're offsets into the
-    // reordered src1/dst buffers produced by mmid_counting_sort_rows.
-    struct row_entry {
-        int32_t contiguous_row;  // index into reordered src1/dst
-        int32_t original_row;    // index into original src1/dst
-        int32_t expert_id;
-    };
-
-    std::vector<row_entry> gpu_hits;   // experts in cache -> GPU compute
-    std::vector<row_entry> cpu_misses; // experts not in cache -> CPU compute
-
-    bool has_hits() const { return !gpu_hits.empty(); }
-    bool has_misses() const { return !cpu_misses.empty(); }
-    bool is_all_hits() const { return cpu_misses.empty(); }
-    bool is_all_misses() const { return gpu_hits.empty(); }
-    int total_rows() const { return (int)(gpu_hits.size() + cpu_misses.size()); }
+// Which tier computes a contribution.
+enum moe_exec_tier {
+    MOE_TIER_GPU_HIT  = 0,  // expert weights resident in the GPU cache
+    MOE_TIER_CPU_MISS = 1,  // computed on CPU over host/mmap weights
 };
 
-// Build a partition by checking which experts are in the GPU cache.
-// expert_ids[i] is the expert assigned to contiguous row i.
-// Returns a partition with rows classified as hits or misses.
+// One expert's share of one token's output.
+struct moe_contribution {
+    int32_t original_row   = -1;  // destination row in dst, pre-sort order
+    int32_t contiguous_row = -1;  // source row in the reordered src1
+    int32_t expert_id      = -1;
+    // The router's coefficient for this (token, expert). The merge is a
+    // weighted sum; omitting this made the previous merge wrong
+    // independently of the overwrite bug.
+    float   routing_weight = 0.0f;
+    int32_t projection     = -1;  // 0=gate, 1=up, 2=down
+    moe_exec_tier tier     = MOE_TIER_CPU_MISS;
+    // For hits, the resident region, so execution does not repeat the
+    // residency query the partition already did.
+    void *  slot_ptr       = nullptr;
+};
+
+// A batch's worth of contributions, in a fixed order.
+struct moe_hybrid_partition {
+    std::vector<moe_contribution> contributions;
+
+    int n_hits() const {
+        int n = 0;
+        for (const auto & c : contributions) {
+            if (c.tier == MOE_TIER_GPU_HIT) n++;
+        }
+        return n;
+    }
+    int n_misses() const { return (int)contributions.size() - n_hits(); }
+    bool empty() const { return contributions.empty(); }
+    bool all_hits() const { return !empty() && n_misses() == 0; }
+    bool all_misses() const { return !empty() && n_hits() == 0; }
+
+    // Distinct destination rows. Not contributions.size(): n_expert_used
+    // contributions share one destination row, which is exactly why the
+    // merge accumulates rather than copies.
+    int n_destination_rows() const;
+};
+
+// Build the partition for one (layer, projection) over a routed batch.
+//
+// expert_ids[i]      -- expert assigned to contiguous row i
+// routing_weights[i] -- that expert's coefficient for the row; may be null,
+//                       in which case weights are recorded as 1.0
+// original_rows[i]   -- destination row for contiguous row i; may be null
+//                       when the batch was not reordered, in which case the
+//                       contiguous index is used
+//
+// Residency is queried with moe_expert_cache::contains(), which does not
+// disturb cache statistics or eviction order -- a partition must not
+// change what it is measuring.
 moe_hybrid_partition moe_build_partition(
     const int32_t * expert_ids,
-    int64_t n_rows,
-    int32_t layer_id,
-    moe_expert_cache * cache);
+    const float *   routing_weights,
+    const int32_t * original_rows,
+    int64_t         n_rows,
+    int32_t         layer_id,
+    int             projection,
+    const moe_expert_cache * cache);
 
-// Hybrid execution context: holds CPU buffers for miss computation.
-struct moe_hybrid_context {
-    // CPU-side buffers for miss rows.
-    std::vector<float> cpu_src1;     // [n_miss_rows * ne10]  activations
-    std::vector<float> cpu_dst;      // [n_miss_rows * ne0]   outputs
-    std::vector<float> cpu_expert;   // [expert_bytes/4]      workspace
-
-    bool initialized = false;
-
-    void init(int64_t ne10, int64_t ne0, int max_miss_rows, size_t expert_bytes);
-};
-
-// Execute CPU miss path: compute expert outputs on CPU using
-// host-resident (mmap-backed) expert weights.
-// src0_host: pointer to the expert weight tensor in host memory
-//            (indexed by expert_id * expert_stride)
-// src1_host: pointer to the contiguous activation rows on host
-// dst_host: pointer to the contiguous output rows on host
-// partition: the partition (only cpu_misses are used)
-// expert_stride: bytes between consecutive expert weights
-// ne0, ne10: output and input dimensions
-void moe_cpu_miss_execute(
-    const void * src0_host,
-    const float * src1_host,
-    float * dst_host,
+// Accumulate contributions into dst:
+//   dst[row] = sum over that row's contributions of weight * expert_output
+//
+// tier_outputs supplies each contribution's computed expert output in the
+// partition's own order, ne0 floats each. Ordering is fixed by the
+// partition rather than by which tier finished first, so the result does
+// not depend on scheduling (design §3.6).
+//
+// Set zero_dst unless the caller has already zeroed dst; this accumulates.
+void moe_merge_contributions(
     const moe_hybrid_partition & partition,
-    size_t expert_stride,
-    int64_t ne0,
-    int64_t ne10,
-    int32_t n_experts);
+    const float * tier_outputs,
+    float *       dst,
+    int64_t       ne0,
+    bool          zero_dst);
 
-// Merge GPU hit outputs and CPU miss outputs into the final dst buffer.
-// gpu_dst: GPU buffer with computed hit rows
-// cpu_dst: CPU buffer with computed miss rows
-// partition: the partition
-// dst: final output buffer (GPU)
-// ne0: output dimension (per row)
-// row_bytes: bytes per output row
-// stream: SYCL queue for the final copy
-void moe_merge_outputs(
-    const float * gpu_dst,
-    const float * cpu_dst,
-    const moe_hybrid_partition & partition,
-    float * dst,
-    int64_t ne0,
-    size_t row_bytes,
-    void * stream);
-
-// Hybrid metrics for Prometheus export.
+// Hybrid metrics for Prometheus export (Task G6).
 struct moe_hybrid_metrics {
     int64_t hit_rows = 0;
     int64_t miss_rows = 0;
