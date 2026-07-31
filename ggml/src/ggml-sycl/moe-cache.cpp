@@ -150,6 +150,12 @@ bool moe_expert_cache::observe_geometry(int32_t layer, int projection,
         // the caller keeps falling back to plain host copies.
         return false;
     }
+    // The one line hardware validation looks for: what the cache decided
+    // the model's projections look like, and what that bought.
+    fprintf(stderr, "moe_cache: geometry learned (gate=%zu up=%zu down=%zu), "
+                    "%d slots of %zu bytes\n",
+            m_geom_bytes[0], m_geom_bytes[1], m_geom_bytes[2],
+            (int)m_slots.size(), m_expert_bytes);
     m_obs_completed.clear();
     m_obs_completed.shrink_to_fit();
     m_obs_current_origin = nullptr;
