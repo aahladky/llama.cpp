@@ -434,6 +434,34 @@ static void test_cpu_misses_fail_closed_on_unknown_types() {
                                  4, 1, act, 0, out) == -1);
 }
 
+static void test_parallel_gemv_batch_matches_sequential() {
+    // The threaded batch must be bit-identical to sequential execution:
+    // chunks only partition WHICH rows a worker computes, never the math
+    // or the order within a row.
+    CASE("G4: parallel gemv batch is bit-identical to sequential");
+    const int64_t ne00 = 128, ne01 = 6;
+    const int n_expert = 5;
+    const auto w = f32_experts(n_expert, ne01, ne00);
+    const auto act = ramp_activation(ne00);
+
+    const size_t n_jobs = 12;
+    std::vector<float> seq(n_jobs * (size_t) ne01), par(n_jobs * (size_t) ne01);
+    std::vector<moe_cpu_gemv_job> js(n_jobs), jp(n_jobs);
+    for (size_t k = 0; k < n_jobs; k++) {
+        const float * ew = w.data() + (k % n_expert) * (size_t)(ne01 * ne00);
+        js[k] = {ew, act.data(), seq.data() + k * (size_t) ne01};
+        jp[k] = {ew, act.data(), par.data() + k * (size_t) ne01};
+    }
+    CHECK(moe_cpu_execute_gemvs(js.data(), n_jobs, GGML_TYPE_F32, ne00, ne01, 1));
+    CHECK(moe_cpu_execute_gemvs(jp.data(), n_jobs, GGML_TYPE_F32, ne00, ne01, 8));
+    CHECK(memcmp(seq.data(), par.data(), seq.size() * sizeof(float)) == 0);
+
+    // Unsupported type fails closed without touching outputs.
+    par.assign(par.size(), -3.0f);
+    CHECK(!moe_cpu_execute_gemvs(jp.data(), n_jobs, /*wtype=*/-1, ne00, ne01, 8));
+    CHECK_NEAR(par[0], -3.0f);
+}
+
 static void test_cpu_misses_then_merge_produce_the_routed_sum() {
     // End to end for the pieces that exist: partition (all miss) ->
     // CPU execution -> weighted merge equals the directly computed
@@ -491,6 +519,7 @@ int main() {
     test_cpu_misses_dequantize_with_ggml_math();
     test_cpu_misses_leave_hit_outputs_untouched();
     test_cpu_misses_fail_closed_on_unknown_types();
+    test_parallel_gemv_batch_matches_sequential();
     test_cpu_misses_then_merge_produce_the_routed_sum();
 
     if (g_failures) {

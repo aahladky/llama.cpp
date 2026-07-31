@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 int moe_hybrid_partition::n_destination_rows() const {
@@ -75,6 +76,112 @@ moe_hybrid_partition moe_build_partition(
     return part;
 }
 
+bool moe_cpu_can_execute(int wtype) {
+    if (wtype < 0 || wtype >= GGML_TYPE_COUNT) {
+        return false;
+    }
+    const enum ggml_type type = (enum ggml_type) wtype;
+    if (type == GGML_TYPE_F32) {
+        return true;
+    }
+    const struct ggml_type_traits * traits = ggml_get_type_traits(type);
+    return traits && traits->to_float;
+}
+
+bool moe_cpu_expert_gemv(
+    const void *  expert_weights,
+    int           wtype,
+    int64_t       ne00,
+    int64_t       ne01,
+    const float * activation,
+    float *       out)
+{
+    if (!expert_weights || !activation || !out || ne00 <= 0 || ne01 <= 0 ||
+        !moe_cpu_can_execute(wtype)) {
+        return false;
+    }
+    const enum ggml_type type = (enum ggml_type) wtype;
+    const bool is_f32 = (type == GGML_TYPE_F32);
+    const struct ggml_type_traits * traits = ggml_get_type_traits(type);
+    const size_t row_bytes = ggml_row_size(type, ne00);
+
+    std::vector<float> row_f32;
+    if (!is_f32) {
+        row_f32.resize((size_t) ne00);
+    }
+    for (int64_t o = 0; o < ne01; o++) {
+        const void * wrow = (const uint8_t *) expert_weights + (size_t) o * row_bytes;
+        const float * frow;
+        if (is_f32) {
+            frow = (const float *) wrow;
+        } else {
+            traits->to_float(wrow, row_f32.data(), ne00);
+            frow = row_f32.data();
+        }
+        double acc = 0.0;
+        for (int64_t j = 0; j < ne00; j++) {
+            acc += (double) frow[j] * (double) activation[j];
+        }
+        out[o] = (float) acc;
+    }
+    return true;
+}
+
+bool moe_cpu_execute_gemvs(
+    const moe_cpu_gemv_job * jobs,
+    size_t        n_jobs,
+    int           wtype,
+    int64_t       ne00,
+    int64_t       ne01,
+    int           n_threads)
+{
+    if (!jobs || n_jobs == 0 || !moe_cpu_can_execute(wtype)) {
+        return n_jobs == 0 && moe_cpu_can_execute(wtype);
+    }
+    for (size_t k = 0; k < n_jobs; k++) {
+        if (!jobs[k].weights || !jobs[k].activation || !jobs[k].out) {
+            return false;
+        }
+    }
+
+    const int workers = std::max(1, std::min<int>(n_threads, (int) n_jobs));
+    if (workers == 1) {
+        for (size_t k = 0; k < n_jobs; k++) {
+            if (!moe_cpu_expert_gemv(jobs[k].weights, wtype, ne00, ne01,
+                                     jobs[k].activation, jobs[k].out)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Contiguous chunks: each output row has exactly one writer, so the
+    // result is identical to sequential execution regardless of how the
+    // chunks are scheduled.
+    std::vector<std::thread> pool;
+    pool.reserve((size_t) workers - 1);
+    std::atomic<bool> ok{true};
+    auto worker = [&](size_t begin, size_t end) {
+        for (size_t k = begin; k < end && ok.load(std::memory_order_relaxed); k++) {
+            if (!moe_cpu_expert_gemv(jobs[k].weights, wtype, ne00, ne01,
+                                     jobs[k].activation, jobs[k].out)) {
+                ok.store(false, std::memory_order_relaxed);
+            }
+        }
+    };
+    const size_t chunk = (n_jobs + (size_t) workers - 1) / (size_t) workers;
+    for (int w = 1; w < workers; w++) {
+        const size_t begin = (size_t) w * chunk;
+        if (begin >= n_jobs) break;
+        pool.emplace_back(worker, begin, std::min(n_jobs, begin + chunk));
+    }
+    worker(0, std::min(n_jobs, chunk));
+    for (auto & t : pool) {
+        t.join();
+    }
+    return ok.load();
+}
+
 int64_t moe_cpu_execute_misses(
     const moe_hybrid_partition & partition,
     const void *  weights_base,
@@ -95,25 +202,17 @@ int64_t moe_cpu_execute_misses(
         return -1;
     }
 
-    const bool is_f32 = (type == GGML_TYPE_F32);
-    const struct ggml_type_traits * traits = ggml_get_type_traits(type);
-    if (!is_f32 && (!traits || !traits->to_float)) {
+    if (!moe_cpu_can_execute(wtype)) {
         // No dequantizer for this type: the caller fails closed to the
         // non-hybrid path. Guessing here is defect 4 of the old scaffold
         // (quant blocks reinterpreted as floats) all over again.
         return -1;
     }
-    const size_t row_bytes = ggml_row_size(type, ne00);
 
-    // One dequantized row at a time: the working set stays one row
-    // (ne00 floats) regardless of expert count, and the quantized row is
-    // read exactly once -- for a cold mmap expert the page faults on that
-    // read ARE the cost, and nothing here reads a weight byte twice.
-    std::vector<float> row_f32;
-    if (!is_f32) {
-        row_f32.resize((size_t)ne00);
-    }
-
+    // moe_cpu_expert_gemv dequantizes one row at a time: the working set
+    // stays one row (ne00 floats) regardless of expert count, and every
+    // quantized row is read exactly once -- for a cold mmap expert the
+    // page faults on that read ARE the cost.
     int64_t computed = 0;
     for (size_t k = 0; k < partition.contributions.size(); k++) {
         const moe_contribution & c = partition.contributions[k];
@@ -128,26 +227,9 @@ int64_t moe_cpu_execute_misses(
         const float * act = activations
                           + (size_t) c.contiguous_row * act_stride_floats;
         float * out = outputs + k * (size_t) ne01;
-
-        for (int64_t o = 0; o < ne01; o++) {
-            const void * wrow = expert + (size_t) o * row_bytes;
-            const float * frow;
-            if (is_f32) {
-                frow = (const float *) wrow;
-            } else {
-                traits->to_float(wrow, row_f32.data(), ne00);
-                frow = row_f32.data();
-            }
-            // Plain f32 dot; accumulate in double for a batch-1 row so
-            // the CPU tier does not drift from the GPU tier's f32
-            // accumulation more than the quantization already does.
-            double acc = 0.0;
-            for (int64_t j = 0; j < ne00; j++) {
-                acc += (double) frow[j] * (double) act[j];
-            }
-            out[o] = (float) acc;
+        if (moe_cpu_expert_gemv(expert, wtype, ne00, ne01, act, out)) {
+            computed++;
         }
-        computed++;
     }
     return computed;
 }

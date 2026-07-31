@@ -71,8 +71,10 @@
 #ifdef GGML_MOE_EXPERT_CACHE
 #include "ggml-sycl/moe-cache.hpp"
 #include <cstring>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include "moe-hybrid.hpp"
 // Cache configuration, set via ggml_backend_moe_cache_configure_v1 (see
 // ggml_backend_sycl_reg_get_proc_address below) -- no longer written
@@ -4763,14 +4765,40 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     }
 }
 
+// Global hybrid metrics (accumulated across all layers). GPU-hit/CPU-miss
+// hybrid execution (Task G4/G5): under --moe-hybrid-mode, a miss the cache
+// declines to admit is NOT staged to the device at all -- its rows execute
+// on CPU inside ggml_sycl_mul_mat_id over the original host weights, and
+// h2d_bytes_avoided counts the transfers that never happened.
+static std::atomic<int64_t> g_hybrid_hit_rows{0};
+static std::atomic<int64_t> g_hybrid_miss_rows{0};
+static std::atomic<int64_t> g_hybrid_gpu_fallback_rows{0};
+static std::atomic<double>  g_hybrid_cpu_miss_time_ms{0.0};
+static std::atomic<double>  g_hybrid_gpu_hit_time_ms{0.0};
+static std::atomic<double>  g_hybrid_merge_time_ms{0.0};
+static std::atomic<int64_t> g_hybrid_h2d_bytes_avoided{0};
+static std::atomic<int64_t> g_hybrid_staging_skips{0};
+
+// Worker count for the CPU tier: leave two cores for the SYCL runtime
+// and the server threads. The gemvs are dequant-heavy, and the tier
+// single-threaded measurably lost to the transfers it replaced.
+static int moe_cpu_tier_threads() {
+    static const int n = std::max(1, std::min(16,
+        (int) std::thread::hardware_concurrency() - 2));
+    return n;
+}
+
 // MoE cache hook for the scheduler: called before copying each expert
 // from host to device.  Checks the cache for the expert; on hit, copies
 // from cache slot to dst (GPU-to-GPU).  On miss, promotes to cache slot
 // and copies from cache slot to dst.  Returns true if copied from cache.
+// Under hybrid mode a declined miss is left unstaged and recorded for
+// CPU-tier execution (see the tail of this function).
 static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name,
                                  int32_t expert_id, int32_t n_experts,
                                  const uint8_t * host_src,
-                                 size_t expert_bytes, uint8_t * dst) {
+                                 size_t expert_bytes, uint8_t * dst,
+                                 int wtype) {
     // The hook is registered globally; only handle SYCL backends so the
     // context cast below is safe in mixed-backend builds.
     if (!ggml_backend_is_sycl(backend)) return false;
@@ -4836,26 +4864,34 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
         return true;
     }
 
-    // Promotion failed (cache full or below admission threshold):
-    // fall through to normal host-to-device copy.
+    // Promotion declined (cache full or below admission threshold). This
+    // is the transfer hybrid execution exists to avoid: under hybrid
+    // mode, when the weights are CPU-computable, SKIP the host->device
+    // copy entirely and record the expert for CPU-tier execution inside
+    // the op (Task G4). ggml_sycl_mul_mat_id takes the plan keyed by the
+    // staged tensor's device base.
+    if (g_moe_hybrid_mode && moe_cpu_can_execute(wtype)) {
+        const void * cpy_base = dst - (size_t) expert_id * expert_bytes;
+        ctx->moe_cache->hybrid_record_skip(cpy_base, expert_id, host_src, wtype);
+        // MMQ kernels read up to 512 bytes past the previous expert's
+        // region, i.e. into the FIRST bytes of this one. The previous
+        // expert may have been staged without its padding tail (the
+        // scheduler's fallback copy only pads the last of a contiguous
+        // run), so stage this expert's head from host to keep that
+        // over-read NaN-free. 512 bytes, not the multi-megabyte expert.
+        q->memcpy(dst, host_src, std::min(expert_bytes, (size_t) 512));
+        g_hybrid_h2d_bytes_avoided += expert_bytes;
+        g_hybrid_staging_skips += 1;
+        return true;
+    }
+
+    // Fall through to normal host-to-device copy.
     ctx->moe_cache->inc_host_weight_copy_fallback();
     return false;
 }
 
-// Global hybrid metrics (accumulated across all layers).
-// NOTE: true GPU-hit/CPU-miss hybrid execution is NOT implemented. Misses
-// under --moe-hybrid-mode execute on the same device mul_mat as everything
-// else, so they are counted as gpu_fallback_rows -- never as CPU misses.
-// hit_rows/miss_rows and the timing/bytes counters below stay at 0 until a
-// real CPU-miss path (see the unreferenced stubs in moe-hybrid.cpp) lands;
-// they are reported for stats-schema stability only.
-static std::atomic<int64_t> g_hybrid_hit_rows{0};
-static std::atomic<int64_t> g_hybrid_miss_rows{0};
-static std::atomic<int64_t> g_hybrid_gpu_fallback_rows{0};
-static std::atomic<double>  g_hybrid_cpu_miss_time_ms{0.0};
-static std::atomic<double>  g_hybrid_gpu_hit_time_ms{0.0};
-static std::atomic<double>  g_hybrid_merge_time_ms{0.0};
-static std::atomic<int64_t> g_hybrid_h2d_bytes_avoided{0};
+// (Hybrid metrics globals are declared above moe_cache_hook_copy, which
+// updates them at staging time.)
 
 // Collect cache stats from all initialized caches.
 //
@@ -4893,6 +4929,7 @@ std::string moe_cache_collect_stats() {
             result += ",\"gpu_hit_time_ms\":" + std::to_string(g_hybrid_gpu_hit_time_ms.load());
             result += ",\"merge_time_ms\":" + std::to_string(g_hybrid_merge_time_ms.load());
             result += ",\"h2d_bytes_avoided\":" + std::to_string(g_hybrid_h2d_bytes_avoided.load());
+            result += ",\"staging_skips\":" + std::to_string(g_hybrid_staging_skips.load());
             result += "}";
         }
     }
@@ -4985,8 +5022,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
+    // Hybrid execution (Tasks G4/G5): take any CPU-tier plan the staging
+    // hook recorded for this tensor -- experts whose host->device copy
+    // was deliberately skipped. Taken exactly once and unconditionally,
+    // so a stale plan can never survive into a later graph run. Those
+    // experts' src0 regions were never written: every path below must
+    // route their rows to the CPU tier, and fused kernels (which read
+    // across expert regions) must stay off while a plan is pending.
+    moe_expert_cache::hybrid_plan hplan;
+    if (ctx.moe_cache) {
+        hplan = ctx.moe_cache->hybrid_take_plan(src0->data);
+    }
+
     if (ne12 == 1) {
-        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+        if (hplan.empty() &&
+            ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
             return;
         }
     }
@@ -5024,6 +5074,23 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     dst_row.nb[2] = nb1;
     dst_row.nb[3] = nb1;
     if (ne12 == 1) {
+        // Batch-1 decode: one gemv per routed row. Under hybrid, rows of
+        // unstaged experts go to the CPU tier; the rest run on GPU as
+        // before. Phases (design §3.7): read the CPU rows' activations
+        // first (the stream was drained above, so this waits on nothing),
+        // queue every GPU row asynchronously, compute the CPU rows on the
+        // host WHILE the GPU works, then write the CPU results into their
+        // dst rows -- the in-order queue lands those after the GPU
+        // kernels, and the row sets are disjoint either way.
+        struct hybrid_cpu_row {
+            const void * host_w;
+            const char * act_dev;
+            char *       dst_dev;
+        };
+        std::vector<hybrid_cpu_row> cpu_rows;
+        struct gpu_row_desc { int64_t i02, i11, i12, i1, i2; };
+        std::vector<gpu_row_desc> gpu_rows;
+
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t i02 = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -5035,12 +5102,70 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 const int64_t i1 = id;
                 const int64_t i2 = i12;
 
-            src0_row.data = src0_original + i02*nb02;
-            src1_row.data = src1_original + i11*nb11 + i12*nb12;
-            dst_row.data = dst_original + i1*nb1 + i2*nb2;
-
-            ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+                if (!hplan.empty() && hplan.has_expert(i02)) {
+                    cpu_rows.push_back({
+                        hplan.host_src_for(i02),
+                        src1_original + i11*nb11 + i12*nb12,
+                        dst_original + i1*nb1 + i2*nb2});
+                    continue;
+                }
+                gpu_rows.push_back({i02, i11, i12, i1, i2});
             }
+        }
+
+        std::vector<float> cpu_acts;
+        if (!cpu_rows.empty()) {
+            // CPU tier reads f32 activations and writes f32 outputs; the
+            // graphs this runs in always satisfy that, and the unstaged
+            // weights leave no fallback if it were ever violated.
+            GGML_ASSERT(src1->type == GGML_TYPE_F32);
+            GGML_ASSERT(dst->type == GGML_TYPE_F32);
+            cpu_acts.resize(cpu_rows.size() * (size_t) ne10);
+            for (size_t k = 0; k < cpu_rows.size(); k++) {
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
+                    cpu_acts.data() + k * (size_t) ne10,
+                    cpu_rows[k].act_dev, ne10 * sizeof(float))));
+            }
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+        }
+
+        for (const auto & g : gpu_rows) {
+            src0_row.data = src0_original + g.i02*nb02;
+            src1_row.data = src1_original + g.i11*nb11 + g.i12*nb12;
+            dst_row.data = dst_original + g.i1*nb1 + g.i2*nb2;
+            ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+        }
+
+        if (!cpu_rows.empty()) {
+            const auto t_cpu0 = std::chrono::steady_clock::now();
+            std::vector<float> cpu_outs(cpu_rows.size() * (size_t) ne0);
+            std::vector<moe_cpu_gemv_job> jobs(cpu_rows.size());
+            for (size_t k = 0; k < cpu_rows.size(); k++) {
+                jobs[k] = {cpu_rows[k].host_w,
+                           cpu_acts.data() + k * (size_t) ne10,
+                           cpu_outs.data() + k * (size_t) ne0};
+            }
+            // The skip decision already verified the type; a failure here
+            // has no fallback (the weights were never staged), so it must
+            // be loud, not wrong.
+            const bool ok = moe_cpu_execute_gemvs(
+                jobs.data(), jobs.size(), (int) src0->type, ne00, ne01,
+                moe_cpu_tier_threads());
+            GGML_ASSERT(ok && "hybrid CPU tier failed after staging was skipped");
+            const auto t_cpu1 = std::chrono::steady_clock::now();
+            for (size_t k = 0; k < cpu_rows.size(); k++) {
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
+                    cpu_rows[k].dst_dev,
+                    cpu_outs.data() + k * (size_t) ne0,
+                    ne0 * sizeof(float))));
+            }
+            const auto t_mrg = std::chrono::steady_clock::now();
+            g_hybrid_miss_rows += (int64_t) cpu_rows.size();
+            g_hybrid_hit_rows += (int64_t) gpu_rows.size();
+            g_hybrid_cpu_miss_time_ms = g_hybrid_cpu_miss_time_ms.load() +
+                std::chrono::duration<double, std::milli>(t_cpu1 - t_cpu0).count();
+            g_hybrid_merge_time_ms = g_hybrid_merge_time_ms.load() +
+                std::chrono::duration<double, std::milli>(t_mrg - t_cpu1).count();
         }
     } else {
         const int64_t n_routed_rows = ids->ne[1] * n_ids;
@@ -5088,19 +5213,24 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
-        // Hybrid dispatch: true GPU-hit/CPU-miss execution is NOT
-        // implemented. Every expert -- hit or miss -- executes on the device
-        // via the same mul_mat below; cache misses fall back to GPU. The
-        // previous placeholder hit classification
-        // (lookup(layer=0, projection=0, proj_bytes=0)) could never return a
-        // real hit (the geometry guard in moe_expert_cache::lookup rejects
-        // proj_bytes=0) and has been removed. Rows run under
-        // --moe-hybrid-mode are therefore reported conservatively as
-        // gpu_fallback_rows, never as CPU misses. The unreferenced stubs in
-        // moe-hybrid.cpp (moe_build_partition / moe_cpu_miss_execute /
-        // moe_merge_outputs) are reserved for a future phase.
+        // Hybrid dispatch (Tasks G4/G5): experts the staging hook left
+        // unstaged execute on CPU over the original host weights; the
+        // rest run on the device as before. GPU experts are queued first
+        // (async); the CPU tier's D2H of its activation slices is ordered
+        // after the gather kernel by the in-order queue, and its results
+        // are written into dst_contiguous before the scatter kernel below
+        // is submitted. Experts with no plan and hybrid mode on are
+        // counted as gpu_fallback_rows -- the metric never implies CPU
+        // execution that did not happen.
         const bool hybrid_active = g_moe_hybrid_mode &&
                                    ctx.moe_cache && ctx.moe_cache_enabled;
+        struct hybrid_cpu_expert {
+            int64_t      row_offset;
+            int64_t      n_rows;
+            const void * host_w;
+        };
+        std::vector<hybrid_cpu_expert> cpu_experts;
+
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             const int64_t num_src1_rows = expert_row_counts[i02];
 
@@ -5110,12 +5240,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
             const int64_t expert_row_offset = expert_row_offsets[i02];
 
-            // GPU path: device mul_mat for all experts (hybrid "misses"
-            // included -- CPU-miss execution is not implemented).
-            src0_row.data = src0_original + i02*nb02;
-
             GGML_ASSERT(nb11 == sizeof(float)*ne10);
             GGML_ASSERT(nb1 == sizeof(float)*ne0);
+
+            if (!hplan.empty() && hplan.has_expert((int32_t) i02)) {
+                cpu_experts.push_back({expert_row_offset, num_src1_rows,
+                                       hplan.host_src_for((int32_t) i02)});
+                continue;
+            }
+
+            src0_row.data = src0_original + i02*nb02;
+
             src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
             src1_row.ne[1] = num_src1_rows;
 
@@ -5132,10 +5267,60 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
 
             if (hybrid_active) {
-                // GPU fallback, not a CPU miss: count separately so metrics
-                // never imply CPU execution that did not happen.
-                g_hybrid_gpu_fallback_rows += num_src1_rows;
+                if (hplan.empty()) {
+                    g_hybrid_gpu_fallback_rows += num_src1_rows;
+                } else {
+                    g_hybrid_hit_rows += num_src1_rows;
+                }
             }
+        }
+
+        if (!cpu_experts.empty()) {
+            int64_t cpu_row_total = 0;
+            for (const auto & ce : cpu_experts) {
+                cpu_row_total += ce.n_rows;
+            }
+            std::vector<float> cpu_acts((size_t) cpu_row_total * ne10);
+            std::vector<float> cpu_outs((size_t) cpu_row_total * ne0);
+            size_t at = 0;
+            for (const auto & ce : cpu_experts) {
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
+                    cpu_acts.data() + at * (size_t) ne10,
+                    src1_contiguous.get() + ce.row_offset*nb11,
+                    (size_t) ce.n_rows * ne10 * sizeof(float))));
+                at += (size_t) ce.n_rows;
+            }
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+
+            const auto t_cpu0 = std::chrono::steady_clock::now();
+            std::vector<moe_cpu_gemv_job> jobs((size_t) cpu_row_total);
+            at = 0;
+            for (const auto & ce : cpu_experts) {
+                for (int64_t r = 0; r < ce.n_rows; r++, at++) {
+                    jobs[at] = {ce.host_w,
+                                cpu_acts.data() + at * (size_t) ne10,
+                                cpu_outs.data() + at * (size_t) ne0};
+                }
+            }
+            const bool ok = moe_cpu_execute_gemvs(
+                jobs.data(), jobs.size(), (int) src0->type, ne00, ne01,
+                moe_cpu_tier_threads());
+            GGML_ASSERT(ok && "hybrid CPU tier failed after staging was skipped");
+            const auto t_cpu1 = std::chrono::steady_clock::now();
+            at = 0;
+            for (const auto & ce : cpu_experts) {
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
+                    dst_contiguous.get() + ce.row_offset*nb1,
+                    cpu_outs.data() + at * (size_t) ne0,
+                    (size_t) ce.n_rows * ne0 * sizeof(float))));
+                at += (size_t) ce.n_rows;
+            }
+            const auto t_mrg = std::chrono::steady_clock::now();
+            g_hybrid_miss_rows += cpu_row_total;
+            g_hybrid_cpu_miss_time_ms = g_hybrid_cpu_miss_time_ms.load() +
+                std::chrono::duration<double, std::milli>(t_cpu1 - t_cpu0).count();
+            g_hybrid_merge_time_ms = g_hybrid_merge_time_ms.load() +
+                std::chrono::duration<double, std::milli>(t_mrg - t_cpu1).count();
         }
 
         {

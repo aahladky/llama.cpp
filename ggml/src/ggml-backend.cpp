@@ -1653,7 +1653,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 const uint8_t * src = (const uint8_t *)input->data + eid * expert_size;
                                 uint8_t * dst = (uint8_t *)input_cpy->data + eid * expert_size;
                                 bool from_cache = s_moe_cache_copy(
-                                    split_backend, input->name, eid, (int32_t)n_expert, src, expert_size, dst);
+                                    split_backend, input->name, eid, (int32_t)n_expert, src, expert_size, dst,
+                                    (int) input->type);
                                 if (!from_cache) {
                                     // Not in cache: copy from host to input_cpy.
                                     // The hook already promoted to cache slot.

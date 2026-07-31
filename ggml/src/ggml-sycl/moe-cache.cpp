@@ -403,6 +403,36 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
     return (char *)slot.device_ptr + offset;
 }
 
+void moe_expert_cache::hybrid_record_skip(const void * cpy_base, int32_t expert_id,
+                                          const void * host_src, int wtype) {
+    if (!cpy_base || expert_id < 0 || !host_src) return;
+    std::lock_guard<std::mutex> lock(m_hybrid_mutex);
+    hybrid_plan & plan = m_hybrid_plans[cpy_base];
+    plan.wtype = wtype;
+    // The hook can fire more than once per (tensor, expert) when a tensor
+    // feeds several splits; one CPU computation per expert is enough.
+    if (!plan.has_expert(expert_id)) {
+        plan.skips.push_back({expert_id, host_src});
+    }
+}
+
+bool moe_expert_cache::hybrid_plan_pending(const void * cpy_base) const {
+    std::lock_guard<std::mutex> lock(m_hybrid_mutex);
+    auto it = m_hybrid_plans.find(cpy_base);
+    return it != m_hybrid_plans.end() && !it->second.empty();
+}
+
+moe_expert_cache::hybrid_plan moe_expert_cache::hybrid_take_plan(const void * cpy_base) {
+    std::lock_guard<std::mutex> lock(m_hybrid_mutex);
+    hybrid_plan out;
+    auto it = m_hybrid_plans.find(cpy_base);
+    if (it != m_hybrid_plans.end()) {
+        out = std::move(it->second);
+        m_hybrid_plans.erase(it);
+    }
+    return out;
+}
+
 bool moe_expert_cache::contains(int32_t layer, int32_t expert,
                                 int projection) const {
     std::lock_guard<std::mutex> lock(m_mutex);

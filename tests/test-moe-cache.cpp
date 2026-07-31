@@ -596,6 +596,53 @@ static void test_same_key_different_model_is_a_miss() {
 }
 
 // ---------------------------------------------------------------------
+// Hybrid staging plan (Task G4)
+// ---------------------------------------------------------------------
+
+static void test_hybrid_plan_roundtrip_and_single_take() {
+    // The hook records skips at staging time; the op takes the plan
+    // exactly once. A second take must come back empty -- a stale plan
+    // surviving into the next graph run would route rows to weights that
+    // WERE staged that time.
+    CASE("hybrid plan: record, take once, then empty");
+    moe_expert_cache cache;
+    CHECK(cache.init(make_config(4), nullptr));
+
+    char cpy_a[8], host_w[8];
+    cache.hybrid_record_skip(cpy_a, 3, host_w, /*wtype=*/0);
+    cache.hybrid_record_skip(cpy_a, 5, host_w + 4, 0);
+    cache.hybrid_record_skip(cpy_a, 3, host_w, 0);  // duplicate: ignored
+    CHECK(cache.hybrid_plan_pending(cpy_a));
+
+    auto plan = cache.hybrid_take_plan(cpy_a);
+    CHECK_EQ((long long)plan.skips.size(), 2LL);
+    CHECK(plan.has_expert(3));
+    CHECK(plan.has_expert(5));
+    CHECK(!plan.has_expert(4));
+    CHECK_EQ(plan.host_src_for(5), (const void *)(host_w + 4));
+
+    CHECK(!cache.hybrid_plan_pending(cpy_a));
+    CHECK(cache.hybrid_take_plan(cpy_a).empty());
+}
+
+static void test_hybrid_plans_are_isolated_per_staged_tensor() {
+    // Two tensors staged concurrently (main + draft context) must never
+    // see each other's skips.
+    CASE("hybrid plan: keys are per staged tensor");
+    moe_expert_cache cache;
+    CHECK(cache.init(make_config(4), nullptr));
+
+    char cpy_a[4], cpy_b[4], w[4];
+    cache.hybrid_record_skip(cpy_a, 1, w, 0);
+    cache.hybrid_record_skip(cpy_b, 2, w, 0);
+    auto pa = cache.hybrid_take_plan(cpy_a);
+    CHECK(pa.has_expert(1));
+    CHECK(!pa.has_expert(2));
+    auto pb = cache.hybrid_take_plan(cpy_b);
+    CHECK(pb.has_expert(2));
+}
+
+// ---------------------------------------------------------------------
 // Concurrent lifecycle (two compute threads + a metrics/reset thread)
 // ---------------------------------------------------------------------
 
@@ -666,6 +713,8 @@ int main() {
     test_no_observations_never_initializes();
 
     test_same_key_different_model_is_a_miss();
+    test_hybrid_plan_roundtrip_and_single_take();
+    test_hybrid_plans_are_isolated_per_staged_tensor();
     test_concurrent_use_and_reset_survive();
 
     if (g_failures) {

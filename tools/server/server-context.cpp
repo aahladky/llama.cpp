@@ -4468,6 +4468,28 @@ void server_routes::init_routes() {
                         { "llamacpp:moe_cache_host_weight_copy_fallbacks_total",
                           "Projection copies that bypassed the cache and went host-to-device",
                           "counter", "host_weight_copy_fallbacks", false },
+                        // Hybrid GPU-hit/CPU-miss execution (Tasks G4/G5).
+                        { "llamacpp:moe_hybrid_gpu_rows_total",
+                          "Routed rows executed on GPU while hybrid was engaged",
+                          "counter", "hit_rows", false },
+                        { "llamacpp:moe_hybrid_cpu_rows_total",
+                          "Routed rows executed on CPU over host weights",
+                          "counter", "miss_rows", false },
+                        { "llamacpp:moe_hybrid_gpu_fallback_rows_total",
+                          "Rows run fully on GPU because no hybrid plan was pending",
+                          "counter", "gpu_fallback_rows", false },
+                        { "llamacpp:moe_hybrid_staging_skips_total",
+                          "Expert host-to-device transfers avoided entirely",
+                          "counter", "staging_skips", false },
+                        { "llamacpp:moe_hybrid_h2d_bytes_avoided_total",
+                          "Bytes of expert weight transfer avoided by the CPU tier",
+                          "counter", "h2d_bytes_avoided", false },
+                        { "llamacpp:moe_hybrid_cpu_time_ms",
+                          "Cumulative CPU-tier compute time", "counter",
+                          "cpu_miss_time_ms", true },
+                        { "llamacpp:moe_hybrid_merge_time_ms",
+                          "Cumulative CPU-result merge (H2D) submit time", "counter",
+                          "merge_time_ms", true },
                     };
 
                     for (const auto & m : metrics) {

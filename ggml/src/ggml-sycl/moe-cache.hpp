@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -224,6 +225,53 @@ public:
     // The device queue every cache submission uses (see the init contract).
     void * queue() const { return m_queue; }
 
+    // ---- hybrid staging plan (Task G4) ------------------------------
+    // Under hybrid mode the scheduler hook SKIPS the host->device copy
+    // for a miss expert the cache declined to admit -- avoiding that
+    // transfer is the entire saving -- and records it here. The op that
+    // consumes the staged tensor then computes those experts' rows on
+    // CPU over the original host weights. The plan is keyed by the
+    // STAGED tensor's device base address: it is what both sides can
+    // see (the hook gets dst, the op gets src0->data), it is unique per
+    // staged tensor, and it cannot collide across two models the way
+    // tensor names do.
+
+    struct hybrid_skip {
+        int32_t      expert_id = -1;
+        const void * host_src  = nullptr;  // this expert's weights on host
+    };
+
+    struct hybrid_plan {
+        std::vector<hybrid_skip> skips;
+        int          wtype = -1;           // ggml_type of the weights
+        bool empty() const { return skips.empty(); }
+        bool has_expert(int32_t eid) const {
+            for (const auto & s : skips) {
+                if (s.expert_id == eid) return true;
+            }
+            return false;
+        }
+        const void * host_src_for(int32_t eid) const {
+            for (const auto & s : skips) {
+                if (s.expert_id == eid) return s.host_src;
+            }
+            return nullptr;
+        }
+    };
+
+    // Record one skipped staging copy for the tensor staged at cpy_base.
+    void hybrid_record_skip(const void * cpy_base, int32_t expert_id,
+                            const void * host_src, int wtype);
+
+    // True when a plan is pending for this staged tensor (the op must
+    // then avoid fused kernels that would read the unstaged regions).
+    bool hybrid_plan_pending(const void * cpy_base) const;
+
+    // Remove and return the plan for this staged tensor (empty plan when
+    // none). The op takes it exactly once per execution; a stale plan
+    // must never survive into the next graph run.
+    hybrid_plan hybrid_take_plan(const void * cpy_base);
+
     // Look up (layer, expert) for a specific projection (0=gate, 1=up, 2=down).
     // proj_bytes must match the learned projection size AND host_src must
     // match the pointer the projection was promoted from (tensor identity
@@ -337,6 +385,13 @@ private:
     std::vector<moe_cache_layer_index> m_layer_index;
     std::vector<int> m_miss_counts;
     moe_cache_stats m_stats;
+
+    // Pending hybrid plans, keyed by staged-tensor device base. Written
+    // at staging time, taken at op time within the same split execution;
+    // ordinarily holds at most a couple of entries (interleaved main +
+    // draft contexts).
+    mutable std::mutex m_hybrid_mutex;
+    std::map<const void *, hybrid_plan> m_hybrid_plans;
 };
 
 #endif // GGML_SYCL_MOE_CACHE_HPP

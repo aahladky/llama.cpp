@@ -374,12 +374,17 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
     // MoE expert cache hook: the scheduler calls this before copying each
-    // expert from host to device.  Returns true if the expert was copied
-    // from the cache, false if it should be copied from host.
+    // expert from host to device.  Returns true if the expert's staging is
+    // fully handled (copied from the cache, or -- under hybrid mode --
+    // deliberately left unstaged for CPU-tier execution inside the op),
+    // false if it should be copied from host.  wtype is the weight
+    // tensor's ggml_type, which the hybrid path needs to decide whether
+    // the expert is CPU-computable before committing to skip its staging.
     typedef bool (*ggml_backend_sched_moe_cache_fn)(ggml_backend_t backend, const char * tensor_name,
                                                       int32_t expert_id, int32_t n_experts,
                                                       const uint8_t * host_src,
-                                                      size_t expert_bytes, uint8_t * dst);
+                                                      size_t expert_bytes, uint8_t * dst,
+                                                      int wtype);
     GGML_API void ggml_backend_sched_set_moe_cache_hook(ggml_backend_sched_moe_cache_fn fn);
 
     //

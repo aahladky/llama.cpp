@@ -2660,10 +2660,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             // Implemented sub-features (consumed by modelctl via these names):
             const bool moe_weight_transfer_cache = cache_implemented;  // device slot cache + scheduler hook
-            const bool moe_hybrid_cpu_miss        = false;  // NOT IMPLEMENTED: CPU-miss execution does not
-                                                             // exist; misses fall back to the GPU path.
-                                                             // (moe-hybrid.cpp holds unreferenced stubs for
-                                                             // a future phase.)
+            // Hybrid GPU-hit/CPU-miss execution (Tasks G4/G5): under
+            // --moe-hybrid-mode, a miss the cache declines to admit is
+            // never staged to the device; its rows execute on CPU over
+            // the host/mmap weights inside mul_mat_id and merge in-op.
+            // Rides on the cache infrastructure (hook + plan), so it is
+            // exactly as available as the cache itself. Validated
+            // token-identical against cache-off on 2026-07-31.
+            const bool moe_hybrid_cpu_miss        = cache_implemented;
             const bool moe_cache_metrics         = cache_implemented;  // /metrics + stats JSON
             const bool moe_cache_prefill_policy  = cache_implemented;  // prefill/decode phase admission policy
             const bool moe_cache_reset           = cache_implemented;  // cache reset via API
@@ -2747,12 +2751,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 printf("    \"moe_cache_min_batch\": %d,\n", moe_min_batch);
             }
             printf("    \"moe_cache_supported_projections\": [\"gate\", \"up\", \"down\"],\n");
-            // Hybrid constraints: hybrid CPU-miss execution is not implemented,
-            // so there are no supported archs/quants and no overlap. Fields stay
-            // present (schema stability) but report empty/false.
-            printf("    \"moe_hybrid_supported_archs\": [],\n");
-            printf("    \"moe_hybrid_supported_quant\": [],\n");
-            printf("    \"moe_hybrid_can_overlap\": false\n");
+            // Hybrid constraints. The mechanism operates at tensor level
+            // (no per-architecture assumptions), and the CPU tier handles
+            // every weight type ggml has a dequantizer for -- unsupported
+            // types are simply never skipped from staging (fail-safe).
+            // The CPU tier runs concurrently with the queued GPU rows.
+            printf("    \"moe_hybrid_supported_archs\": [\"any\"],\n");
+            printf("    \"moe_hybrid_supported_quant\": [\"any_with_dequantizer\"],\n");
+            printf("    \"moe_hybrid_can_overlap\": %s\n", moe_hybrid_cpu_miss ? "true" : "false");
             printf("  },\n");
             // CLI flag names (canonical keys)
             printf("  \"cli\": {\n");

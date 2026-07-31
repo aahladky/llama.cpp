@@ -146,6 +146,45 @@ int64_t moe_cpu_execute_misses(
     size_t        act_stride_floats,
     float *       outputs);
 
+// Can moe_cpu_execute_misses handle this weight type? The staging hook
+// asks BEFORE committing to skip an expert's device copy -- a skip whose
+// CPU tier then fails closed would leave garbage rows.
+bool moe_cpu_can_execute(int wtype);
+
+// One expert's gemv over host weights: out[o] = dot(dequant(row_o), act)
+// for o in [0, ne01). The single-expert core of moe_cpu_execute_misses,
+// exposed for the in-op hybrid path, which addresses experts directly
+// rather than through a partition. Returns false when the type is
+// unsupported (caller must have checked moe_cpu_can_execute).
+bool moe_cpu_expert_gemv(
+    const void *  expert_weights,
+    int           wtype,
+    int64_t       ne00,
+    int64_t       ne01,
+    const float * activation,
+    float *       out);
+
+// A batch of independent expert gemvs, executed across threads. This is
+// what the in-op CPU tier calls: dequantizing an 800 KB projection per
+// routed row is compute-heavy, and single-threaded it measurably LOSES
+// to the transfer it replaced (1.9 vs 4.3 t/s on the 122B target).
+// Jobs are split into contiguous chunks over at most n_threads workers;
+// each job is one expert's full gemv, so rows never interleave and the
+// output is bit-identical to the sequential order. Returns false (and
+// computes nothing) if any job's type would be unsupported.
+struct moe_cpu_gemv_job {
+    const void *  weights;    // one expert's projection weights (host)
+    const float * activation; // ne00 floats
+    float *       out;        // ne01 floats
+};
+bool moe_cpu_execute_gemvs(
+    const moe_cpu_gemv_job * jobs,
+    size_t        n_jobs,
+    int           wtype,
+    int64_t       ne00,
+    int64_t       ne01,
+    int           n_threads);
+
 // Hybrid metrics for Prometheus export (Task G6).
 struct moe_hybrid_metrics {
     int64_t hit_rows = 0;
