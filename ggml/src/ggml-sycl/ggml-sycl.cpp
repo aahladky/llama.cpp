@@ -82,7 +82,28 @@
 // the same interface -- a weak extern cannot be satisfied across a
 // dlopen boundary.
 static volatile size_t g_moe_cache_budget_bytes = 0;
+// Per-device overrides. -1 sentinel (as size_t max) means "not set for
+// this device": fall back to the uniform budget. Cards in one box are
+// rarely the same size, so a single budget is either wasteful on the big
+// card or an OOM on the small one.
+static constexpr size_t MOE_CACHE_BUDGET_UNSET = (size_t) -1;
+static volatile size_t g_moe_cache_budget_per_device[GGML_SYCL_MAX_DEVICES] = {};
+static volatile bool   g_moe_cache_budget_per_device_set = false;
 static volatile size_t g_moe_cache_admission = 1;
+
+// The budget this device should use: its own when the caller supplied a
+// per-device map, otherwise the uniform one.
+static size_t moe_cache_budget_for_device(int device) {
+    if (g_moe_cache_budget_per_device_set
+            && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        const size_t v = g_moe_cache_budget_per_device[device];
+        if (v != MOE_CACHE_BUDGET_UNSET) {
+            return v;
+        }
+    }
+    return g_moe_cache_budget_bytes;
+}
+
 static volatile char   g_moe_cache_policy[16] = "lru";
 static volatile bool   g_moe_cache_prefill_admit = false;
 // Last phase the server announced. Cache creation is lazy (the first
@@ -4730,9 +4751,13 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     int layer = moe_cache_parse_layer(tensor_name);
     if (layer < 0) return;
 
-    // Total budget comes from server-configured state (see
-    // ggml_backend_moe_cache_configure_v1).
-    if (g_moe_cache_budget_bytes == 0) return;
+    // Budget comes from server-configured state (see
+    // ggml_backend_moe_cache_configure_v1) -- this device's own when a
+    // per-device map was supplied, else the uniform one. Zero means no
+    // cache on this device, which under a per-device map is the explicit
+    // answer for every device the map does not name.
+    const size_t device_budget = moe_cache_budget_for_device(ctx.device);
+    if (device_budget == 0) return;
 
     std::lock_guard<std::mutex> lock(g_moe_cache_registry_mutex);
 
@@ -4761,7 +4786,7 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
 
     moe_cache_config cfg;
     cfg.device_id = ctx.device;
-    cfg.budget_bytes = g_moe_cache_budget_bytes;
+    cfg.budget_bytes = device_budget;
     cfg.n_layers = 256;  // generous upper bound; actual layers are sparse
     cfg.n_experts = n_experts;  // per-projection expert count
     cfg.policy = (const char *)g_moe_cache_policy;
@@ -5054,7 +5079,20 @@ static void ggml_backend_sycl_moe_cache_configure_v1(const struct ggml_backend_m
     g_moe_cache_prefill_admit = cfg->prefill_admit;
     snprintf((char *) g_moe_cache_policy, sizeof(g_moe_cache_policy), "%s",
              cfg->policy ? cfg->policy : "lru");
+
+    for (int i = 0; i < GGML_SYCL_MAX_DEVICES; i++) {
+        g_moe_cache_budget_per_device[i] = MOE_CACHE_BUDGET_UNSET;
+    }
+    g_moe_cache_budget_per_device_set = false;
+    if (cfg->per_device_bytes && cfg->n_per_device > 0) {
+        const int n = std::min(cfg->n_per_device, GGML_SYCL_MAX_DEVICES);
+        for (int i = 0; i < n; i++) {
+            g_moe_cache_budget_per_device[i] = cfg->per_device_bytes[i];
+        }
+        g_moe_cache_budget_per_device_set = true;
+    }
 }
+
 
 static int ggml_backend_sycl_moe_cache_reset_all_v1(void) {
     return moe_cache_reset_all();
@@ -7209,7 +7247,14 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
     // cache budget was configured (the server sets the globals from CLI
     // args before backend init); with a zero budget the per-expert hook
     // loop would be pure overhead.
-    if (g_moe_cache_budget_bytes > 0) {
+    // Any nonzero budget -- uniform or on any single device -- means the
+    // hook must run; only a fully zero configuration can skip it.
+    bool any_budget = g_moe_cache_budget_bytes > 0;
+    for (int i = 0; !any_budget && i < GGML_SYCL_MAX_DEVICES; i++) {
+        const size_t v = g_moe_cache_budget_per_device[i];
+        any_budget = (v != MOE_CACHE_BUDGET_UNSET && v > 0);
+    }
+    if (any_budget) {
         ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
         ggml_backend_sched_set_moe_cache_abandon_hook(moe_cache_abandon_pending);
     }

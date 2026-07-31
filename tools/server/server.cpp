@@ -151,21 +151,48 @@ int llama_server(common_params & params, int argc, char ** argv) {
         {
             const moe_cache_procs & procs = moe_cache_get_procs();
             if (procs.available()) {
-                ggml_backend_moe_cache_config cfg;
-                cfg.budget_bytes     = params.moe_cache_bytes;
-                cfg.admission_misses = params.moe_cache_admission;
-                cfg.policy           = params.moe_cache_policy.c_str();
-                cfg.prefill_admit    = params.moe_cache_prefill;
+                // Flattened per-device budgets, index-addressed, kept
+                // alive across the configure() call.
+                std::vector<size_t> per_device;
+                if (!params.moe_cache_bytes_per_device.empty()) {
+                    const int max_index =
+                        params.moe_cache_bytes_per_device.rbegin()->first;
+                    per_device.assign((size_t) max_index + 1, 0);
+                    for (const auto & kv : params.moe_cache_bytes_per_device) {
+                        per_device[(size_t) kv.first] = kv.second;
+                    }
+                }
+                ggml_backend_moe_cache_config cfg = {};
+                cfg.budget_bytes      = params.moe_cache_bytes;
+                cfg.admission_misses  = params.moe_cache_admission;
+                cfg.policy            = params.moe_cache_policy.c_str();
+                cfg.prefill_admit     = params.moe_cache_prefill;
+                cfg.per_device_bytes  = per_device.empty() ? nullptr : per_device.data();
+                cfg.n_per_device      = (int) per_device.size();
                 procs.configure(&cfg);
                 if (procs.hybrid_set_mode) {
                     procs.hybrid_set_mode(params.moe_hybrid_mode ? 1 : 0);
                 }
             }
-            if (params.moe_cache_bytes > 0) {
+            const bool cache_requested = params.moe_cache_bytes > 0
+                || !params.moe_cache_bytes_per_device.empty();
+            if (cache_requested) {
                 if (procs.available()) {
-                    SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
-                            params.moe_cache_bytes, params.moe_cache_policy.c_str(),
-                            params.moe_cache_admission);
+                    if (params.moe_cache_bytes_per_device.empty()) {
+                        SRV_INF("MoE expert cache enabled: %zu bytes per GPU, policy=%s, admission=%d\n",
+                                params.moe_cache_bytes, params.moe_cache_policy.c_str(),
+                                params.moe_cache_admission);
+                    } else {
+                        std::string budgets;
+                        for (const auto & kv : params.moe_cache_bytes_per_device) {
+                            if (!budgets.empty()) budgets += ", ";
+                            budgets += "dev" + std::to_string(kv.first) + "="
+                                     + std::to_string(kv.second);
+                        }
+                        SRV_INF("MoE expert cache enabled per device: %s (unnamed devices: none), policy=%s, admission=%d\n",
+                                budgets.c_str(), params.moe_cache_policy.c_str(),
+                                params.moe_cache_admission);
+                    }
                 } else {
                     SRV_WRN("%s", "MoE expert cache requested but this build has no SYCL backend\n");
                 }
