@@ -1,6 +1,11 @@
 // MoE Expert Cache — implementation.
 
+// Policy only: admission, eviction, phase, reset, stats.  No SYCL headers --
+// every device operation goes through moe_cache_device_* in
+// moe-cache-device.cpp.  That separation is what lets tests/test-moe-cache.cpp
+// link this file and exercise the policy without a GPU.
 #include "moe-cache.hpp"
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -12,9 +17,7 @@ moe_expert_cache::~moe_expert_cache() {
         if (m_host_only) {
             free(m_pool);
         } else if (m_queue) {
-            try {
-                ggml_sycl_free_device(m_pool, *m_queue);
-            } catch (...) {}
+            moe_cache_device_free(m_pool, m_queue);
         }
         m_pool = nullptr;
     }
@@ -23,7 +26,7 @@ moe_expert_cache::~moe_expert_cache() {
     }
 }
 
-bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
+bool moe_expert_cache::init(const moe_cache_config & cfg, void * queue) {
     // Host-only is opt-in AND requires a null queue, so a production caller
     // that accidentally passes null still gets a hard failure rather than a
     // silently device-less cache.
@@ -71,16 +74,10 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, queue_ptr queue) {
     if (m_host_only) {
         m_pool = malloc(m_pool_bytes);
     } else {
-        try {
-            m_pool = ggml_sycl_malloc_device(m_pool_bytes, *queue);
-        } catch (const sycl::exception & e) {
-            fprintf(stderr, "moe_cache: pool allocation of %zu bytes failed: %s\n",
-                    m_pool_bytes, e.what());
-            m_pool = nullptr;
-        }
+        m_pool = moe_cache_device_alloc(m_pool_bytes, queue);
     }
-    // USM allocators can return null on OOM without throwing, so the
-    // try/catch above is not sufficient on its own.
+    // The allocator reports both a throw and a null OOM return as null, so
+    // this check covers every failure path.
     if (!m_pool) {
         fprintf(stderr, "moe_cache: pool allocation of %zu bytes returned null\n",
                 m_pool_bytes);
@@ -259,21 +256,12 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
     }
     if (bytes == 0) return nullptr;
 
-    try {
-        if (m_host_only) {
-            // Unit-test mode: the "device" pool is host memory, so a plain
-            // copy keeps the contents checkable without a GPU.
-            memcpy((char *)slot.device_ptr + offset, host_src, bytes);
-        } else {
-            // Async copy: submit without blocking.  The copy is ordered on the
-            // same queue as subsequent compute, so the GPU serializes it before
-            // any kernel that touches this slot.  Never .wait() in the
-            // steady-state loop -- that would stall the pipeline (plan §5.1).
-            auto ev = m_queue->memcpy((char *)slot.device_ptr + offset, host_src, bytes);
-            (void)ev;  // event available if a future consumer needs explicit sync
-        }
-    } catch (const sycl::exception & e) {
-        fprintf(stderr, "moe_cache: promote_projection failed: %s\n", e.what());
+    if (m_host_only) {
+        // Unit-test mode: the "device" pool is host memory, so a plain
+        // copy keeps the contents checkable without a GPU.
+        memcpy((char *)slot.device_ptr + offset, host_src, bytes);
+    } else if (!moe_cache_device_copy((char *)slot.device_ptr + offset,
+                                      host_src, bytes, m_queue)) {
         return nullptr;
     }
 

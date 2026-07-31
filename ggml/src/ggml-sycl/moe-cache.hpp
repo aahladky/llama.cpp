@@ -26,12 +26,19 @@
 #ifndef GGML_SYCL_MOE_CACHE_HPP
 #define GGML_SYCL_MOE_CACHE_HPP
 
+// Deliberately free of SYCL headers.  The only device concern this header
+// ever had was the queue type, and including ggml-sycl/common.hpp to get it
+// dragged the SYCL headers and the ggml-sycl target's private compile
+// definitions into every consumer -- which is what kept
+// tests/test-moe-cache.cpp out of the build.  The queue is opaque here and
+// cast back to queue_ptr in moe-cache.cpp, the one place that talks to the
+// device.  ctx.stream() converts implicitly, so callers are unaffected.
 #include <cstdint>
+#include <cstddef>
 #include <atomic>
 #include <mutex>
 #include <vector>
 #include <string>
-#include "common.hpp"
 
 // Projections held per expert: gate, up, down.
 #define MOE_CACHE_N_PROJECTIONS 3
@@ -133,13 +140,27 @@ struct moe_cache_config {
     bool host_only_for_testing = false;
 };
 
+// Device operations, defined in moe-cache-device.cpp -- the only translation
+// unit here that includes the SYCL headers.  Splitting them out is what lets
+// the policy implementation (admission, eviction, phase, reset) compile as
+// plain C++, and so lets tests/test-moe-cache.cpp build without a GPU or the
+// ggml-sycl target's private compile definitions.
+//
+// `queue` is a sycl::queue *.  All three report failure by return value
+// rather than throwing, so the policy code needs no SYCL exception handling.
+void * moe_cache_device_alloc(size_t bytes, void * queue);
+void   moe_cache_device_free(void * ptr, void * queue);
+bool   moe_cache_device_copy(void * dst, const void * src, size_t bytes, void * queue);
+
 // The cache itself.
 class moe_expert_cache {
 public:
     moe_expert_cache() = default;
     ~moe_expert_cache();
 
-    bool init(const moe_cache_config & cfg, queue_ptr queue);
+    // queue is a sycl::queue * (queue_ptr); see the note on the includes.
+    // Null is only accepted together with cfg.host_only_for_testing.
+    bool init(const moe_cache_config & cfg, void * queue);
 
     // Look up (layer, expert) for a specific projection (0=gate, 1=up, 2=down).
     // proj_bytes must match the init-time projection size, otherwise the
@@ -202,7 +223,7 @@ private:
         return (layer * m_n_experts + expert) * MOE_CACHE_N_PROJECTIONS + projection;
     }
 
-    queue_ptr m_queue = nullptr;
+    void * m_queue = nullptr;   // sycl::queue *, opaque here
     bool m_initialized = false;
     bool m_host_only = false;
     // Single contiguous allocation backing every slot. One reservation is

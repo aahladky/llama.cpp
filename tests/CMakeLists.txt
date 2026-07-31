@@ -336,12 +336,19 @@ if (TARGET gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
 
-# MoE expert cache unit tests (roadmap Task F8): tests/test-moe-cache.cpp.
+# MoE expert cache unit tests (roadmap Task F8).
 #
-# NOT built yet. The tests themselves are host-only -- no GPU is needed at
-# runtime -- but moe-cache.hpp includes ggml-sycl/common.hpp, which drags in
-# the SYCL headers and the ggml-sycl target's private compile definitions
-# (GGML_SYCL_WARP_SIZE and friends). Reproducing that build configuration in
-# a test target is the wrong fix; the cache's policy state (admission,
-# eviction, phase) needs separating from its device concerns first, after
-# which this compiles as a plain C++ test with no SYCL at all.
+# Builds and runs everywhere, including CPU-only machines and CI: the cache's
+# policy (admission, eviction, phase, reset) lives in moe-cache.cpp with no
+# SYCL headers, and every device operation is behind moe_cache_device_* in
+# moe-cache-device.cpp, which is not linked here. The test supplies aborting
+# stubs for those three symbols; host-only mode never calls them.
+#
+# Compiled directly rather than via llama_build_and_test because it needs
+# neither llama nor common -- only the cache translation unit.
+add_executable(test-moe-cache
+    test-moe-cache.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl/moe-cache.cpp)
+target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+add_test(NAME test-moe-cache COMMAND test-moe-cache)
+set_property(TEST test-moe-cache PROPERTY LABELS main)

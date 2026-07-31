@@ -14,9 +14,34 @@
 #include "ggml-sycl/moe-cache.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// The policy lives in moe-cache.cpp and links here; the device operations
+// live in moe-cache-device.cpp, which needs SYCL and is deliberately not
+// linked. Host-only mode never reaches them, so these stubs exist only to
+// satisfy the linker -- and abort rather than no-op, so a test that strays
+// onto the device path fails loudly instead of quietly passing.
+static void device_path_unreachable(const char * what) {
+    fprintf(stderr, "moe_cache: host-only test reached the device path (%s)\n", what);
+    abort();
+}
+
+// GCC notices these never return and suggests marking them noreturn, which
+// would contradict the return types the header declares. The suggestion is
+// correct and inapplicable, so it is silenced here rather than repo-wide.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsuggest-attribute=noreturn"
+#endif
+void * moe_cache_device_alloc(size_t, void *) { device_path_unreachable("alloc"); return nullptr; }
+void   moe_cache_device_free(void *, void *) { device_path_unreachable("free"); }
+bool   moe_cache_device_copy(void *, const void *, size_t, void *) { device_path_unreachable("copy"); return false; }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 static int g_failures = 0;
 static std::string g_case;
