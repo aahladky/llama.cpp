@@ -4367,6 +4367,15 @@ static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_ten
            dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
+// Scheduler input copies (named "<backend>#<src>#<idx>") are refilled
+// from the host on every graph run -- with or without the cache hook.
+// A one-time in-place reorder with a sticky flag would make later runs'
+// raw restaged bytes be read as reordered. Model-owned weight tensors
+// never contain '#', so the name is a reliable discriminator.
+static bool is_sched_input_copy(const ggml_tensor * t) {
+    return strchr(t->name, '#') != nullptr;
+}
+
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                             ggml_tensor * dst, mul_mat_algo mm_algorithm) {
     if (!should_reorder_tensor(*ctx, dst)) {
@@ -4376,6 +4385,9 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (!extra || extra->optimized_feature.reorder) {
         return;  // Skip permutations and already reordered tensors
+    }
+    if (is_sched_input_copy(src0)) {
+        return;
     }
 
     switch (mm_algorithm) {
@@ -4417,7 +4429,13 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     // GGUF-layout bytes every graph run; a one-time in-place reorder with
     // a sticky flag would make fused kernels read those raw bytes as
     // reordered from the second decode step on. Skipping the optimization
-    // is always safe; reordering here is not.
+    // is always safe; reordering here is not. Two detectors: the sched
+    // copy-name pattern covers every restaged tensor even with no cache
+    // configured (no hook registered), the staged-base set is the
+    // authoritative record where the hook runs.
+    if (is_sched_input_copy(src0)) {
+        return;
+    }
     if (ctx->moe_cache && ctx->moe_cache->is_staged_base(src0->data)) {
         return;
     }
