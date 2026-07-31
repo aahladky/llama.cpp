@@ -197,7 +197,6 @@ int64_t moe_cpu_execute_misses(
         ne00 <= 0 || ne01 <= 0 || expert_stride_bytes == 0) {
         return -1;
     }
-    const enum ggml_type type = (enum ggml_type) wtype;
     if (wtype < 0 || wtype >= GGML_TYPE_COUNT) {
         return -1;
     }

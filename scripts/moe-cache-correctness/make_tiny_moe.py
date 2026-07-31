@@ -116,5 +116,17 @@ def build(out_path: str):
     print(f"wrote {out_path}", file=sys.stderr)
 
 if __name__ == "__main__":
-    default_out = str(Path(__file__).resolve().parent / "tiny-moe.gguf")
-    build(sys.argv[1] if len(sys.argv) > 1 else default_out)
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("out", nargs="?",
+                    default=str(Path(__file__).resolve().parent / "tiny-moe.gguf"))
+    ap.add_argument("--n-embd", type=int, default=N_EMBD,
+                    help="hidden dim; K-quant fixtures need a multiple of 256 "
+                         "(QK_K row divisibility, e.g. 256)")
+    ap.add_argument("--n-ff", type=int, default=N_FF,
+                    help="per-expert FFN inner dim; same 256-divisibility "
+                         "note as --n-embd for K-quant fixtures")
+    args = ap.parse_args()
+    N_EMBD = args.n_embd
+    N_FF = args.n_ff
+    build(args.out)
