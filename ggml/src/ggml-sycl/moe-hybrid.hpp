@@ -103,6 +103,49 @@ void moe_merge_contributions(
     int64_t       ne0,
     bool          zero_dst);
 
+// Compute the CPU tier of one projection's partition at batch 1 (Task G3).
+//
+// For every MOE_TIER_CPU_MISS contribution k, computes that expert's
+// output over the host-resident (typically mmap-backed) weights:
+//
+//     outputs[k*ne01 + o] = dot(dequant(expert_row_o), activation_row)
+//
+// weights_base        host base of this projection's expert tensor
+//                     (all experts; expert e's blocks start at
+//                     weights_base + e * expert_stride_bytes)
+// expert_stride_bytes bytes between consecutive experts
+// wtype               the weights' ggml_type (int to keep this header
+//                     ggml-free; moe-hybrid.cpp validates it)
+// ne00                input dim = elements per weight row
+// ne01                output rows per expert
+// activations         f32 activations; contribution k's row is
+//                     activations + contiguous_row * act_stride_floats
+// outputs             partition-ordered tier outputs (design §3.6): the
+//                     k-th contribution's ne01 floats live at k*ne01.
+//                     GPU-hit entries are left untouched.
+//
+// Returns the number of miss contributions computed, or -1 when the
+// weight type has no dequantizer -- the caller must then fail closed to
+// the non-hybrid path rather than guess.
+//
+// Quantized math is ggml's own (ggml_get_type_traits()->to_float per
+// row, then an f32 dot). The design doc's first choice -- calling the
+// CPU backend's mul_mat_id machinery -- is not reachable from the SYCL
+// backend in shared/dynamic builds without a new cross-backend
+// interface; the dequantizer in ggml-base is the same reference math
+// every CPU kernel is tested against, and the miss path is bound by
+// reading the weights (page faults/storage), not by FLOPs, at batch 1.
+int64_t moe_cpu_execute_misses(
+    const moe_hybrid_partition & partition,
+    const void *  weights_base,
+    size_t        expert_stride_bytes,
+    int           wtype,
+    int64_t       ne00,
+    int64_t       ne01,
+    const float * activations,
+    size_t        act_stride_floats,
+    float *       outputs);
+
 // Hybrid metrics for Prometheus export (Task G6).
 struct moe_hybrid_metrics {
     int64_t hit_rows = 0;

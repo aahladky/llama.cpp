@@ -287,6 +287,187 @@ static void test_merge_tolerates_an_empty_partition() {
     CHECK(p.n_destination_rows() == 0);
 }
 
+// --- CPU miss execution (Task G3) ------------------------------------
+
+#include "ggml.h"
+
+// A small deterministic expert-weight fixture: n_expert experts of
+// ne01 x ne00 f32 weights with knowable values.
+static std::vector<float> f32_experts(int n_expert, int64_t ne01, int64_t ne00) {
+    std::vector<float> w((size_t)n_expert * ne01 * ne00);
+    for (size_t i = 0; i < w.size(); i++) {
+        // Bounded, sign-alternating, expert-distinct.
+        w[i] = ((int)(i % 17) - 8) * 0.125f + (float)(i / (ne01 * ne00)) * 0.5f;
+    }
+    return w;
+}
+
+static std::vector<float> ramp_activation(int64_t ne00) {
+    std::vector<float> a((size_t)ne00);
+    for (int64_t j = 0; j < ne00; j++) {
+        a[(size_t)j] = 0.01f * (float)(j % 29) - 0.1f;
+    }
+    return a;
+}
+
+// Reference: plain double-accumulated dot over f32 weights.
+static float ref_dot(const float * w_row, const float * act, int64_t ne00) {
+    double acc = 0.0;
+    for (int64_t j = 0; j < ne00; j++) {
+        acc += (double)w_row[j] * (double)act[j];
+    }
+    return (float)acc;
+}
+
+static moe_hybrid_partition all_miss_partition(const int32_t * experts,
+                                               int64_t n_rows) {
+    return moe_build_partition(experts, nullptr, nullptr, n_rows,
+                               /*layer=*/0, /*projection=*/0,
+                               /*cache=*/nullptr);
+}
+
+static void test_cpu_misses_match_the_f32_reference() {
+    CASE("G3: f32 miss execution matches the reference dot");
+    const int64_t ne00 = 96, ne01 = 5;
+    const int n_expert = 4;
+    const auto w = f32_experts(n_expert, ne01, ne00);
+    const auto act = ramp_activation(ne00);
+
+    const int32_t experts[2] = {1, 3};
+    auto part = all_miss_partition(experts, 2);
+    std::vector<float> out(2 * (size_t)ne01, -777.0f);
+
+    const int64_t n = moe_cpu_execute_misses(
+        part, w.data(), (size_t)ne01 * ne00 * sizeof(float), GGML_TYPE_F32,
+        ne00, ne01, act.data(), /*act_stride=*/0, out.data());
+    CHECK(n == 2);
+    for (int k = 0; k < 2; k++) {
+        const float * exp_w = w.data() + (size_t)experts[k] * ne01 * ne00;
+        for (int64_t o = 0; o < ne01; o++) {
+            CHECK_NEAR(out[(size_t)k * ne01 + o],
+                       ref_dot(exp_w + o * ne00, act.data(), ne00));
+        }
+    }
+}
+
+static void test_cpu_misses_dequantize_with_ggml_math() {
+    // Quantize a known f32 fixture with ggml's own quantizer, run the
+    // executor over the quantized blocks, and compare against the
+    // dequantized reference computed independently here. This pins the
+    // plumbing (row size, expert stride, partition order) AND that the
+    // executor uses ggml's dequantizer rather than reinterpreting blocks
+    // as floats -- defect 4 of the old scaffold.
+    CASE("G3: quantized miss execution goes through ggml's dequantizer");
+    const int64_t ne00 = 256;  // one Q4_K / Q8_0 superblock multiple
+    const int64_t ne01 = 3;
+    const int n_expert = 3;
+    const auto w = f32_experts(n_expert, ne01, ne00);
+    const auto act = ramp_activation(ne00);
+
+    for (const enum ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K,
+                                      GGML_TYPE_Q6_K}) {
+        const size_t row_bytes = ggml_row_size(type, ne00);
+        const size_t expert_bytes = row_bytes * (size_t)ne01;
+        std::vector<uint8_t> q(expert_bytes * n_expert);
+        // Quantize per expert so rows stay row_bytes apart, as in a GGUF.
+        for (int e = 0; e < n_expert; e++) {
+            ggml_quantize_chunk(type, w.data() + (size_t)e * ne01 * ne00,
+                                q.data() + (size_t)e * expert_bytes,
+                                0, ne01, ne00, nullptr);
+        }
+
+        const int32_t experts[2] = {0, 2};
+        auto part = all_miss_partition(experts, 2);
+        std::vector<float> out(2 * (size_t)ne01, 0.0f);
+        const int64_t n = moe_cpu_execute_misses(
+            part, q.data(), expert_bytes, type, ne00, ne01,
+            act.data(), 0, out.data());
+        CHECK(n == 2);
+
+        // Independent reference: dequantize with the public traits and dot.
+        const auto * traits = ggml_get_type_traits(type);
+        std::vector<float> row((size_t)ne00);
+        for (int k = 0; k < 2; k++) {
+            for (int64_t o = 0; o < ne01; o++) {
+                const uint8_t * wrow = q.data()
+                    + (size_t)experts[k] * expert_bytes + (size_t)o * row_bytes;
+                traits->to_float(wrow, row.data(), ne00);
+                CHECK_NEAR(out[(size_t)k * ne01 + o],
+                           ref_dot(row.data(), act.data(), ne00));
+            }
+        }
+    }
+}
+
+static void test_cpu_misses_leave_hit_outputs_untouched() {
+    CASE("G3: GPU-hit entries in the output buffer are not written");
+    const int64_t ne00 = 32, ne01 = 2;
+    const auto w = f32_experts(2, ne01, ne00);
+    const auto act = ramp_activation(ne00);
+
+    const int32_t experts[2] = {0, 1};
+    auto part = all_miss_partition(experts, 2);
+    part.contributions[0].tier = MOE_TIER_GPU_HIT;  // as if resident
+
+    std::vector<float> out(2 * (size_t)ne01, -5.0f);
+    const int64_t n = moe_cpu_execute_misses(
+        part, w.data(), (size_t)ne01 * ne00 * sizeof(float), GGML_TYPE_F32,
+        ne00, ne01, act.data(), 0, out.data());
+    CHECK(n == 1);
+    CHECK_NEAR(out[0], -5.0f);  // hit entry untouched
+    CHECK_NEAR(out[1], -5.0f);
+    CHECK(out[(size_t)ne01] != -5.0f);  // miss entry computed
+}
+
+static void test_cpu_misses_fail_closed_on_unknown_types() {
+    CASE("G3: unsupported weight types fail closed, never guess");
+    const int32_t experts[1] = {0};
+    auto part = all_miss_partition(experts, 1);
+    float out[4] = {0};
+    float act[4] = {0};
+    uint8_t bogus[64] = {0};
+    CHECK(moe_cpu_execute_misses(part, bogus, 64, /*wtype=*/-1,
+                                 4, 1, act, 0, out) == -1);
+    CHECK(moe_cpu_execute_misses(part, bogus, 64, /*wtype=*/GGML_TYPE_COUNT,
+                                 4, 1, act, 0, out) == -1);
+    CHECK(moe_cpu_execute_misses(part, nullptr, 64, GGML_TYPE_F32,
+                                 4, 1, act, 0, out) == -1);
+}
+
+static void test_cpu_misses_then_merge_produce_the_routed_sum() {
+    // End to end for the pieces that exist: partition (all miss) ->
+    // CPU execution -> weighted merge equals the directly computed
+    // routed-MoE output for a two-experts-per-token batch.
+    CASE("G3+G5: executed misses merge into the correct routed sum");
+    const int64_t ne00 = 64, ne01 = 4;
+    const int n_expert = 4;
+    const auto w = f32_experts(n_expert, ne01, ne00);
+    const auto act = ramp_activation(ne00);
+
+    // One token, two experts, distinct routing weights.
+    const int32_t experts[2] = {1, 2};
+    const float   weights_r[2] = {0.7f, 0.3f};
+    const int32_t rows[2] = {0, 0};
+    auto part = moe_build_partition(experts, weights_r, rows, 2, 0, 0, nullptr);
+
+    std::vector<float> tier_out(2 * (size_t)ne01, 0.0f);
+    CHECK(moe_cpu_execute_misses(part, w.data(),
+                                 (size_t)ne01 * ne00 * sizeof(float),
+                                 GGML_TYPE_F32, ne00, ne01,
+                                 act.data(), 0, tier_out.data()) == 2);
+
+    std::vector<float> dst((size_t)ne01, 123.0f);
+    moe_merge_contributions(part, tier_out.data(), dst.data(), ne01, true);
+
+    for (int64_t o = 0; o < ne01; o++) {
+        const float a = ref_dot(w.data() + (size_t)1 * ne01 * ne00 + o * ne00,
+                                act.data(), ne00);
+        const float b = ref_dot(w.data() + (size_t)2 * ne01 * ne00 + o * ne00,
+                                act.data(), ne00);
+        CHECK_NEAR(dst[(size_t)o], 0.7f * a + 0.3f * b);
+    }
+}
+
 int main() {
     test_contains_reports_per_projection_residency();
     test_contains_does_not_disturb_the_cache();
@@ -305,6 +486,12 @@ int main() {
     test_merge_is_tier_independent();
     test_merge_accumulates_when_not_zeroing();
     test_merge_tolerates_an_empty_partition();
+
+    test_cpu_misses_match_the_f32_reference();
+    test_cpu_misses_dequantize_with_ggml_math();
+    test_cpu_misses_leave_hit_outputs_untouched();
+    test_cpu_misses_fail_closed_on_unknown_types();
+    test_cpu_misses_then_merge_produce_the_routed_sum();
 
     if (g_failures) {
         fprintf(stderr, "\n%d check(s) failed\n", g_failures);
