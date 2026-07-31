@@ -5937,6 +5937,19 @@ struct ggml_backend_sycl_device_context {
     std::string name;
     std::string description;
     int op_offload_min_batch_size;
+    // Routed MoE expert ops (MUL_MAT_ID) get their own offload minimum.
+    //
+    // The global threshold is one number for every op type, so reaching the
+    // MoE path at batch 1 -- where the expert transfer cache lives --
+    // requires dragging every unrelated small-batch op through a
+    // cross-backend copy as well. That cost was measured at 41-52% on this
+    // hardware, against a cache gain of 21-48%. Nothing requires the
+    // threshold to be uniform: the minimum belongs to the offload decision,
+    // not to the cache.
+    //
+    // Defaults to op_offload_min_batch_size, so behaviour is unchanged
+    // unless GGML_OP_OFFLOAD_MOE_MIN_BATCH is set explicitly.
+    int op_offload_moe_min_batch_size;
 };
 
 static const char * ggml_backend_sycl_device_get_name(ggml_backend_dev_t dev) {
@@ -6422,7 +6435,14 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 
 static bool ggml_backend_sycl_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_sycl_device_context * sycl_ctx = (ggml_backend_sycl_device_context *)dev->context;
-    return get_op_batch_size(op) >= sycl_ctx->op_offload_min_batch_size;
+    // Routed expert ops answer to their own minimum; see the field comment
+    // on op_offload_moe_min_batch_size. Equal to the global one unless
+    // GGML_OP_OFFLOAD_MOE_MIN_BATCH says otherwise, so this is inert by
+    // default and cannot change existing behaviour.
+    const int minimum = op->op == GGML_OP_MUL_MAT_ID
+                        ? sycl_ctx->op_offload_moe_min_batch_size
+                        : sycl_ctx->op_offload_min_batch_size;
+    return get_op_batch_size(op) >= minimum;
 }
 
 static ggml_backend_event_t
@@ -6823,6 +6843,14 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
         if (!initialized) {
             ggml_backend_sycl_reg_context * ctx = new ggml_backend_sycl_reg_context;
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            // Defaults to the global minimum rather than to 1: unset, the
+            // offload decision is byte-for-byte what it was, so this cannot
+            // regress anything that does not opt in. A non-positive value
+            // is treated as unset rather than as "offload everything",
+            // since atoi() returns 0 for garbage.
+            const char * moe_env = getenv("GGML_OP_OFFLOAD_MOE_MIN_BATCH");
+            const int moe_min_batch_size = (moe_env && atoi(moe_env) > 0)
+                                           ? atoi(moe_env) : min_batch_size;
 
             for (int i = 0; i < ggml_sycl_info().device_count; i++) {
                 ggml_backend_sycl_device_context * dev_ctx = new ggml_backend_sycl_device_context;
@@ -6837,6 +6865,7 @@ ggml_backend_reg_t ggml_backend_sycl_reg() {
 
                 dev_ctx->description = prop.get_name();
                 dev_ctx->op_offload_min_batch_size = min_batch_size;
+                dev_ctx->op_offload_moe_min_batch_size = moe_min_batch_size;
 
                 ggml_backend_dev_t dev = new ggml_backend_device {
                     /* .iface       = */ ggml_backend_sycl_device_interface,

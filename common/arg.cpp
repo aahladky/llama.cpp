@@ -2668,6 +2668,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             const bool moe_cache_prefill_policy  = cache_implemented;  // prefill/decode phase admission policy
             const bool moe_cache_reset           = cache_implemented;  // cache reset via API
             const bool moe_cache_prefetch        = false;     // NOT IMPLEMENTED: expert prefetch (Phase 9)
+            // Routed MoE ops honour their own offload minimum
+            // (GGML_OP_OFFLOAD_MOE_MIN_BATCH). Derived from the same
+            // backend probe as the cache rather than hardcoded: the field
+            // lives in the SYCL backend, so a CPU-only or stock build
+            // correctly reports false and the acceptance matrix's sweep
+            // cells skip instead of measuring a variable nothing reads.
+            const bool moe_offload_threshold_control = cache_implemented;
 
             printf("{\n");
             printf("  \"schema\": 2,\n");
@@ -2692,11 +2699,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             printf("    \"moe_cache_metrics\": %s,\n", moe_cache_metrics ? "true" : "false");
             printf("    \"moe_cache_prefill_policy\": %s,\n", moe_cache_prefill_policy ? "true" : "false");
             printf("    \"moe_cache_reset\": %s,\n", moe_cache_reset ? "true" : "false");
-            printf("    \"moe_cache_prefetch\": %s\n", moe_cache_prefetch ? "true" : "false");
+            printf("    \"moe_cache_prefetch\": %s,\n", moe_cache_prefetch ? "true" : "false");
+            printf("    \"moe_offload_threshold_control\": %s\n", moe_offload_threshold_control ? "true" : "false");
             printf("  },\n");
             // Constraints
             printf("  \"constraints\": {\n");
             printf("    \"moe_cache_backend\": \"%s\",\n", cache_implemented ? cache_backend_name.c_str() : "");
+            // The default batch at which the cache's hook fires. When
+            // moe_offload_threshold_control is true this is overridable per
+            // op type via GGML_OP_OFFLOAD_MOE_MIN_BATCH, so treat it as the
+            // default rather than as a fixed property of the build.
             printf("    \"moe_cache_min_batch\": 32,\n");
             printf("    \"moe_cache_supported_projections\": [\"gate\", \"up\", \"down\"],\n");
             // Hybrid constraints: hybrid CPU-miss execution is not implemented,
