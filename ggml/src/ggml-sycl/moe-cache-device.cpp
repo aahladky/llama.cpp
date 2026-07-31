@@ -3,7 +3,7 @@
 // The only translation unit in the cache that includes the SYCL headers.
 // moe-cache.cpp holds the policy (admission, eviction, phase, reset) and
 // calls through these three functions, so that policy compiles as plain C++
-// and tests/test-moe-cache.cpp (roadmap Task F8) can build and run on a
+// and tests/test-moe-cache.cpp can build and run on a
 // machine with no GPU.
 //
 // Failures are reported by return value rather than by exception: the policy
@@ -53,7 +53,7 @@ bool moe_cache_device_copy(void * dst, const void * src, size_t bytes, void * qu
         // Async copy: submit without blocking.  The copy is ordered on the
         // same queue as subsequent compute, so the GPU serializes it before
         // any kernel that touches this slot.  Never .wait() in the
-        // steady-state loop -- that would stall the pipeline (plan §5.1).
+        // steady-state loop -- that would stall the pipeline.
         auto ev = q->memcpy(dst, src, bytes);
         (void)ev;  // event available if a future consumer needs explicit sync
     } catch (const sycl::exception & e) {

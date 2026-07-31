@@ -1,11 +1,11 @@
-// Deterministic unit tests for the SYCL MoE expert cache (roadmap Task F8).
+// Deterministic unit tests for the SYCL MoE expert cache.
 //
 // These run the real moe_expert_cache in host-only mode: the slot pool is
 // ordinary memory and promotions are plain memcpy, so admission, eviction,
 // phase and geometry logic are exercised with no GPU and no model. That is
-// deliberate -- the admission bug these were written for (Task F3) is pure
-// bookkeeping, and a test that needs a 16 GiB MoE and two Arc cards to run
-// is a test that does not run.
+// deliberate -- these tests cover policy bookkeeping, and a test that
+// needs a 16 GiB MoE and two Arc cards to run is a test that does not
+// run.
 //
 // Cases requiring real devices (two contexts on one GPU, multi-GPU,
 // dynamic backend loading) are not covered here; they need the end-to-end
@@ -110,7 +110,7 @@ static void use_expert(moe_expert_cache & cache, int layer, int expert,
 }
 
 // ---------------------------------------------------------------------
-// Admission (Task F3)
+// Admission
 // ---------------------------------------------------------------------
 
 static void test_admission_threshold_one() {
@@ -596,7 +596,7 @@ static void test_same_key_different_model_is_a_miss() {
 }
 
 // ---------------------------------------------------------------------
-// Hybrid staging plan (Task G4)
+// Hybrid staging plan
 // ---------------------------------------------------------------------
 
 static void test_hybrid_plan_roundtrip_and_single_take() {

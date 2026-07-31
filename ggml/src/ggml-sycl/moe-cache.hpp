@@ -26,13 +26,11 @@
 #ifndef GGML_SYCL_MOE_CACHE_HPP
 #define GGML_SYCL_MOE_CACHE_HPP
 
-// Deliberately free of SYCL headers.  The only device concern this header
-// ever had was the queue type, and including ggml-sycl/common.hpp to get it
-// dragged the SYCL headers and the ggml-sycl target's private compile
-// definitions into every consumer -- which is what kept
-// tests/test-moe-cache.cpp out of the build.  The queue is opaque here and
-// cast back to queue_ptr in moe-cache.cpp, the one place that talks to the
-// device.  ctx.stream() converts implicitly, so callers are unaffected.
+// Deliberately free of SYCL headers, so policy tests build without the
+// SYCL toolchain: queue pointers are opaque here and cast back to
+// queue_ptr in the device translation unit, the one place that talks to
+// the device.  ctx.stream() converts implicitly, so callers are
+// unaffected.
 #include <cstdint>
 #include <cstddef>
 #include <atomic>
@@ -121,10 +119,8 @@ struct moe_cache_stats {
     std::atomic<uint64_t> promotions{0};
     std::atomic<uint64_t> h2d_bytes{0};
     // Projection copies the cache declined to serve, so the weights went
-    // host->device as they would with no cache at all.  This was named
-    // cpu_expert_calls, which described CPU expert *execution* -- something
-    // no shipping backend implements (that is Phase G).  Nothing computed
-    // on the CPU here; the copy simply bypassed the cache.
+    // host->device as they would with no cache at all.  Nothing computes
+    // on the CPU for these; the copy simply bypassed the cache.
     std::atomic<uint64_t> host_weight_copy_fallbacks{0};
     // Projection lookups served from a cache slot.  Counted per projection,
     // not per expert: one expert use touches gate, up and down separately.
@@ -225,7 +221,7 @@ public:
     // The device queue every cache submission uses (see the init contract).
     void * queue() const { return m_queue; }
 
-    // ---- hybrid staging plan (Task G4) ------------------------------
+    // ---- hybrid staging plan ----------------------------------------
     // Under hybrid mode the scheduler hook SKIPS the host->device copy
     // for a miss expert the cache declined to admit -- avoiding that
     // transfer is the entire saving -- and records it here. The op that
@@ -283,8 +279,8 @@ public:
     void * lookup(int32_t layer, int32_t expert, int projection, size_t proj_bytes,
                   const void * host_src = nullptr);
 
-    // Is this projection resident right now?  Task G2's partition builder
-    // needs to ask without changing the answer: lookup() counts a hit or a
+    // Is this projection resident right now?  The hybrid partition
+    // builder needs to ask without changing the answer: lookup() counts a hit or a
     // miss, updates SLRU recency and clears admission progress, all of
     // which are correct for the transfer-cache path and wrong for
     // classifying rows. This touches nothing.
@@ -295,11 +291,9 @@ public:
     //
     // Admission state is per (layer, expert, projection).  One use of an
     // expert misses on gate, up and down separately, so a counter shared
-    // across the three reached an admission threshold of 2 within a single
-    // use -- making "admit on the second use" behave like "admit on the
-    // first".  Worse, a hit on an already-cached projection reset the
-    // shared counter, so whether the remaining projections were ever
-    // admitted depended on the order they happened to be visited in.
+    // across the three would reach an admission threshold of 2 within a
+    // single use -- "admit on the second use" must mean the second USE,
+    // not the second projection touched.  test-moe-cache.cpp pins this.
     void record_miss(int32_t layer, int32_t expert, int projection);
 
     // Promote one projection of an expert into the cache.

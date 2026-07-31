@@ -1,11 +1,11 @@
-// Hybrid MoE Execution — partition representation (roadmap Task G2) and
-// CPU miss execution (Task G3).
+// Hybrid MoE Execution — partition representation and CPU miss
+// execution.
 //
 // No SYCL here: partition, merge and the CPU tier are plain C++ (plus
 // ggml-base for the quant dequantizers), which is what lets
-// tests/test-moe-hybrid.cpp run without a GPU. GPU hit dispatch (G4),
-// the in-op merge (G5) and async promotion (G6) are not wired; see
-// modelctl/docs/moe-hybrid-execution-design.md §4.
+// tests/test-moe-hybrid.cpp run without a GPU. GPU hit dispatch and the
+// in-op hybrid integration live in ggml-sycl.cpp; promotion-delay and
+// eviction-before-reuse counters are not recorded.
 
 #include "moe-hybrid.hpp"
 
@@ -265,7 +265,7 @@ void moe_merge_contributions(
 
     // Fixed order: the partition's own. Accumulating in completion order
     // would make the same input produce different output run to run, since
-    // float addition is not associative (design §3.6).
+    // float addition is not associative.
     for (size_t k = 0; k < partition.contributions.size(); k++) {
         const moe_contribution & c = partition.contributions[k];
         if (c.original_row < 0) {

@@ -1,9 +1,11 @@
-// Deterministic unit tests for the hybrid MoE partition (roadmap Task G2).
+// Deterministic unit tests for the hybrid MoE partition and its CPU
+// miss executor.
 //
-// Host-only, in the shape Task F8 established: the partition and merge are
-// plain bookkeeping, and a test that needs two Arc cards and a 31 GiB model
-// is a test that does not get run. Execution (G3/G4) is not implemented, so
-// nothing here claims to test it.
+// Host-only, like test-moe-cache.cpp: the partition, merge, and CPU-tier
+// math are plain bookkeeping, and a test that needs two Arc cards and a
+// 31 GiB model is a test that does not get run. GPU hit dispatch needs
+// real devices and is covered by the fixtures under
+// scripts/moe-cache-correctness/.
 //
 // The cases that matter most are the ones the previous representation got
 // wrong: two experts contributing to one token, and routing coefficients
@@ -287,7 +289,7 @@ static void test_merge_tolerates_an_empty_partition() {
     CHECK(p.n_destination_rows() == 0);
 }
 
-// --- CPU miss execution (Task G3) ------------------------------------
+// --- CPU miss execution ----------------------------------------------
 
 #include "ggml.h"
 

@@ -76,25 +76,20 @@
 #include <mutex>
 #include <thread>
 #include "moe-hybrid.hpp"
-// Cache configuration, set via ggml_backend_moe_cache_configure_v1 (see
-// ggml_backend_sycl_reg_get_proc_address below) -- no longer written
-// directly by the server as weak externs. That pattern relied on the
-// static/dynamic linker resolving a weak symbol across object files, which
-// does not work when the SYCL backend is loaded via GGML_BACKEND_DL=ON
-// (a separately dlopen'd .so does not satisfy a weak extern in the main
-// executable); the registry proc-address lookup works correctly in both
-// static and dynamic-backend builds because it goes through the same
-// backend-registry mechanism regardless of how the backend was loaded.
+// Cache configuration is obtained through backend registry procedures
+// (ggml_backend_moe_cache_configure_v1 via reg_get_proc_address below)
+// so static and dynamically loaded (GGML_BACKEND_DL) SYCL backends use
+// the same interface -- a weak extern cannot be satisfied across a
+// dlopen boundary.
 static volatile size_t g_moe_cache_budget_bytes = 0;
 static volatile size_t g_moe_cache_admission = 1;
 static volatile char   g_moe_cache_policy[16] = "lru";
 static volatile bool   g_moe_cache_prefill_admit = false;
-// Last phase the server announced. The cache is created lazily on the
-// first expert copy, which happens *during* prefill -- so set_phase(true)
-// reached an empty registry and was lost, and the new cache started in
-// decode. Prefill protection then never applied to the first prompt, the
-// one most likely to flood the cache with single-use experts. Recording
-// the phase here lets lazy init adopt it.
+// Last phase the server announced. Cache creation is lazy (the first
+// expert copy happens *during* prefill), so newly created caches adopt
+// this instead of a decode default -- otherwise prefill protection
+// would never apply to the first prompt, the one most likely to flood
+// the cache with single-use experts.
 static volatile bool   g_moe_cache_phase_is_prefill = false;
 static volatile int    g_moe_hybrid_mode = 0;  // 0=off, 1=hybrid
 
@@ -4766,7 +4761,7 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
 }
 
 // Global hybrid metrics (accumulated across all layers). GPU-hit/CPU-miss
-// hybrid execution (Task G4/G5): under --moe-hybrid-mode, a miss the cache
+// hybrid execution: under --moe-hybrid-mode, a miss the cache
 // declines to admit is NOT staged to the device at all -- its rows execute
 // on CPU inside ggml_sycl_mul_mat_id over the original host weights, and
 // h2d_bytes_avoided counts the transfers that never happened.
@@ -4868,7 +4863,7 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     // is the transfer hybrid execution exists to avoid: under hybrid
     // mode, when the weights are CPU-computable, SKIP the host->device
     // copy entirely and record the expert for CPU-tier execution inside
-    // the op (Task G4). ggml_sycl_mul_mat_id takes the plan keyed by the
+    // the op. ggml_sycl_mul_mat_id takes the plan keyed by the
     // staged tensor's device base.
     if (g_moe_hybrid_mode && moe_cpu_can_execute(wtype)) {
         const void * cpy_base = dst - (size_t) expert_id * expert_bytes;

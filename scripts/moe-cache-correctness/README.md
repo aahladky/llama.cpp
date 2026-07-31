@@ -1,11 +1,12 @@
-# MoE expert-cache correctness fixtures (Task 0.6)
+# MoE expert-cache correctness fixtures
 
-Ad hoc scripts used for the post-sync deterministic correctness matrix
-(`docs/upstream-sync/2026-07-30-correctness-matrix.md` in the top-level
-repo). Not wired into any CI/test runner -- these are reproduction tools,
-not an automated suite. Building a real automated version of this (Task F8)
-is separate future work. (Lives under `scripts/`, not `tests/`, because
-`tests/.gitignore` blanket-ignores everything in that directory.)
+Ad hoc scripts for deterministic token-identity checks of the MoE cache
+against a stock-upstream oracle. Not wired into any CI/test runner --
+these are reproduction tools that exercise real devices and a real
+server, complementing the host-only policy tests in
+`tests/test-moe-cache.cpp` / `tests/test-moe-hybrid.cpp`. (Lives under
+`scripts/`, not `tests/`, because `tests/.gitignore` blanket-ignores
+everything in that directory.)
 
 ## Usage
 
@@ -22,9 +23,9 @@ python3 make_tiny_moe.py                 # writes ./tiny-moe.gguf
 ./run_case.sh <bin-dir> <port> <num-requests> <reset-before-last:0|1> [server args...]
 
 # 3. Sequence of 4 distinct long-form prompts (>32 tokens each, so the
-#    expert-copy staging path in ggml-backend.cpp actually triggers -- short
-#    prompts/decode-only batches were observed to skip it in ways not fully
-#    root-caused, see the correctness-matrix doc), repeated N times.
+#    expert-copy staging path in ggml-backend.cpp actually triggers --
+#    short prompts/decode-only batches sit below the op-offload batch
+#    threshold and never reach the hook), repeated N times.
 ./run_seq.sh <bin-dir> <port> <repeats> [server args...]
 ```
 

@@ -1,18 +1,17 @@
-// Hybrid MoE Execution — partition representation (roadmap Task G2).
+// Hybrid MoE Execution — partition representation.
 //
 // A routed MoE output is the weighted sum of n_expert_used expert outputs
 // per token. The partition therefore is NOT a two-way split of rows: it is
 // a list of *contributions*, each one expert's share of one token's
 // output, tagged with the tier that will compute it.
 //
-// The earlier version of this file modelled it as a row split and merged
-// with memcpy into dst[original_row], so with n_expert_used = 2 the second
-// expert silently overwrote the first, and the routing coefficient was
-// never represented at all. See modelctl/docs/moe-hybrid-execution-design.md
-// §0 for that and the other defects this replaces.
+// A row split with a memcpy merge is wrong output, not an optimization
+// gap: with n_expert_used = 2 the second expert overwrites the first,
+// and the routing coefficient is unrepresented. Merge must accumulate
+// every contribution for a token.
 //
 // This header is deliberately free of SYCL, like moe-cache.hpp, so the
-// partition logic can be unit-tested on any machine (Task F8's pattern).
+// partition logic can be unit-tested on any machine.
 
 #ifndef GGML_SYCL_MOE_HYBRID_HPP
 #define GGML_SYCL_MOE_HYBRID_HPP
@@ -34,8 +33,7 @@ struct moe_contribution {
     int32_t contiguous_row = -1;  // source row in the reordered src1
     int32_t expert_id      = -1;
     // The router's coefficient for this (token, expert). The merge is a
-    // weighted sum; omitting this made the previous merge wrong
-    // independently of the overwrite bug.
+    // weighted sum; a merge without it is wrong output.
     float   routing_weight = 0.0f;
     int32_t projection     = -1;  // 0=gate, 1=up, 2=down
     moe_exec_tier tier     = MOE_TIER_CPU_MISS;
@@ -93,7 +91,7 @@ moe_hybrid_partition moe_build_partition(
 // tier_outputs supplies each contribution's computed expert output in the
 // partition's own order, ne0 floats each. Ordering is fixed by the
 // partition rather than by which tier finished first, so the result does
-// not depend on scheduling (design §3.6).
+// not depend on scheduling.
 //
 // Set zero_dst unless the caller has already zeroed dst; this accumulates.
 void moe_merge_contributions(
@@ -103,7 +101,7 @@ void moe_merge_contributions(
     int64_t       ne0,
     bool          zero_dst);
 
-// Compute the CPU tier of one projection's partition at batch 1 (Task G3).
+// Compute the CPU tier of one projection's partition at batch 1.
 //
 // For every MOE_TIER_CPU_MISS contribution k, computes that expert's
 // output over the host-resident (typically mmap-backed) weights:
@@ -120,7 +118,7 @@ void moe_merge_contributions(
 // ne01                output rows per expert
 // activations         f32 activations; contribution k's row is
 //                     activations + contiguous_row * act_stride_floats
-// outputs             partition-ordered tier outputs (design §3.6): the
+// outputs             partition-ordered tier outputs: the
 //                     k-th contribution's ne01 floats live at k*ne01.
 //                     GPU-hit entries are left untouched.
 //
@@ -129,9 +127,9 @@ void moe_merge_contributions(
 // the non-hybrid path rather than guess.
 //
 // Quantized math is ggml's own (ggml_get_type_traits()->to_float per
-// row, then an f32 dot). The design doc's first choice -- calling the
-// CPU backend's mul_mat_id machinery -- is not reachable from the SYCL
-// backend in shared/dynamic builds without a new cross-backend
+// row, then an f32 dot). Calling the CPU backend's mul_mat_id
+// machinery instead is not reachable from the SYCL backend in
+// shared/dynamic builds without a new cross-backend
 // interface; the dequantizer in ggml-base is the same reference math
 // every CPU kernel is tested against, and the miss path is bound by
 // reading the weights (page faults/storage), not by FLOPs, at batch 1.
@@ -185,7 +183,7 @@ bool moe_cpu_execute_gemvs(
     int64_t       ne01,
     int           n_threads);
 
-// Hybrid metrics for Prometheus export (Task G6).
+// Hybrid metrics for Prometheus export.
 struct moe_hybrid_metrics {
     int64_t hit_rows = 0;
     int64_t miss_rows = 0;
