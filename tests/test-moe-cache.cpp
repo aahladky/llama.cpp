@@ -625,6 +625,65 @@ static void test_hybrid_plan_roundtrip_and_single_take() {
     CHECK(cache.hybrid_take_plan(cpy_a).empty());
 }
 
+static void test_hybrid_purge_drops_pending_plans() {
+    // The scheduler's abandon hook fires when a graph dies mid-compute:
+    // its ops never take their plans, and an orphaned plan taken later by
+    // an unrelated tensor at a reused base would compute with the wrong
+    // host weights.
+    CASE("hybrid purge: abandoned plans do not survive");
+    moe_expert_cache cache;
+    CHECK(cache.init(make_config(4), nullptr));
+
+    char cpy_a[8], cpy_b[8], host_w[8];
+    cache.hybrid_record_skip(cpy_a, 3, host_w, 0);
+    cache.hybrid_record_skip(cpy_b, 5, host_w + 4, 0);
+    CHECK(cache.hybrid_plan_pending(cpy_a));
+    CHECK(cache.hybrid_plan_pending(cpy_b));
+
+    cache.hybrid_purge_plans();
+    CHECK(!cache.hybrid_plan_pending(cpy_a));
+    CHECK(!cache.hybrid_plan_pending(cpy_b));
+    CHECK(cache.hybrid_take_plan(cpy_a).empty());
+}
+
+static void test_staged_bases_survive_reset() {
+    // Reorder safety: a base the hook has ever staged into must stay
+    // marked. Clearing on reset() could race a stage already in flight,
+    // and a stale "staged" mark only costs the reorder optimization.
+    CASE("staged bases: sticky, and reset does not clear them");
+    moe_expert_cache cache;
+    CHECK(cache.init(make_config(4), nullptr));
+
+    char base[8];
+    CHECK(!cache.is_staged_base(base));
+    cache.note_staged_base(base);
+    CHECK(cache.is_staged_base(base));
+
+    cache.reset();
+    CHECK(cache.is_staged_base(base));
+}
+
+static void test_admission_blocked_by_phase_tracks_prefill_policy() {
+    // The hybrid skip must not fire when promotion was declined by phase
+    // policy rather than pressure -- otherwise a cold prompt executes as
+    // per-row scalar CPU GEMVs over every uncached expert.
+    CASE("admission_blocked_by_phase: prefill with admission off, only");
+    moe_expert_cache cache;
+    CHECK(cache.init(make_config(4, /*admission=*/1, "lru",
+                                 /*prefill_admit=*/false), nullptr));
+    CHECK(!cache.admission_blocked_by_phase());
+    cache.set_phase(true);
+    CHECK(cache.admission_blocked_by_phase());
+    cache.set_phase(false);
+    CHECK(!cache.admission_blocked_by_phase());
+
+    moe_expert_cache admit;
+    CHECK(admit.init(make_config(4, /*admission=*/1, "lru",
+                                 /*prefill_admit=*/true), nullptr));
+    admit.set_phase(true);
+    CHECK(!admit.admission_blocked_by_phase());
+}
+
 static void test_hybrid_plans_are_isolated_per_staged_tensor() {
     // Two tensors staged concurrently (main + draft context) must never
     // see each other's skips.
@@ -715,6 +774,9 @@ int main() {
     test_same_key_different_model_is_a_miss();
     test_hybrid_plan_roundtrip_and_single_take();
     test_hybrid_plans_are_isolated_per_staged_tensor();
+    test_hybrid_purge_drops_pending_plans();
+    test_staged_bases_survive_reset();
+    test_admission_blocked_by_phase_tracks_prefill_policy();
     test_concurrent_use_and_reset_survive();
 
     if (g_failures) {

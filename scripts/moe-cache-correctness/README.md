@@ -46,3 +46,16 @@ is not itself meaningful.
   -- `--moe-cache-bytes` needs to be at least that large for the cache to
   initialize at all (silently no-ops below that, logged as
   `moe_cache: init failed on device 0`).
+
+## run_kquant.sh
+
+Q4_K fixture with host-resident experts and `GGML_OP_OFFLOAD_MOE_MIN_BATCH=1`,
+so the staging hook runs on every token -- the config that reaches the
+mmvq_fused reorder path, staged-copy lifetimes, and hybrid skips (all
+invisible to the F32 fixture). Pass conditions: cache output token-identical
+to baseline; hybrid output deterministic across two fresh-server runs
+(the CPU tier's double-accumulated gemvs are ULP-divergent from the GPU
+kernels by design, so bit-identity is not required of it; divergences are
+printed for review).
+
+    PYTHON=<python-with-numpy> ./run_kquant.sh <bindir> <port> [repeats]

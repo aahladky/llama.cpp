@@ -484,6 +484,12 @@ struct common_params {
 
     // MoE expert cache params
     size_t moe_cache_bytes    = 0;         // per-GPU cache budget in bytes (0 = disabled)
+    // Per-device overrides, {device index: bytes}. A device present here
+    // uses its own budget; a device absent gets moe_cache_bytes. Set by
+    // the map form of --moe-cache-bytes (SYCL0=8589934592,SYCL1=0), which
+    // exists because cards in one box are rarely the same size: a uniform
+    // budget is either wasteful on the big card or an OOM on the small one.
+    std::map<int, size_t> moe_cache_bytes_per_device;
     std::string moe_cache_policy = "lru";  // "lru" or "slru"
     int moe_cache_admission   = 2;         // promote after N misses (default 2 per plan)
     bool moe_cache_prefill    = false;     // admit experts during prefill

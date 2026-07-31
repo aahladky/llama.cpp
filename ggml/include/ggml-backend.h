@@ -227,10 +227,18 @@ extern "C" {
     // it exists: a build without the feature simply has no backend reg that
     // resolves these names, and ggml_backend_reg_get_proc_address returns NULL.
     struct ggml_backend_moe_cache_config {
-        size_t      budget_bytes;      // per-device cache budget; 0 disables the cache on that device
+        size_t      budget_bytes;      // default per-device cache budget; 0 disables the cache
         int         admission_misses;  // promote to cached after N misses
         const char *policy;            // "lru" or "slru"
         bool        prefill_admit;     // count misses seen during prefill toward admission
+        // Optional per-device budgets, indexed by backend device index.
+        // When per_device_bytes is non-NULL, device i < n_per_device uses
+        // per_device_bytes[i] (0 = no cache on that device) and devices
+        // beyond the array fall back to budget_bytes. Appended, not
+        // inserted: a caller compiled against the older struct still
+        // works, it simply never sets these.
+        const size_t *per_device_bytes;
+        int           n_per_device;
     };
     typedef void         (*ggml_backend_moe_cache_configure_t)(const struct ggml_backend_moe_cache_config * cfg);
     typedef int          (*ggml_backend_moe_cache_reset_all_t)(void);
@@ -386,6 +394,14 @@ extern "C" {
                                                       size_t expert_bytes, uint8_t * dst,
                                                       int wtype);
     GGML_API void ggml_backend_sched_set_moe_cache_hook(ggml_backend_sched_moe_cache_fn fn);
+
+    // Called when the scheduler abandons a graph mid-compute (a split
+    // returned a non-success status).  Hybrid plans recorded while staging
+    // that graph's inputs will never be taken by their op; the backend
+    // must purge them so a later tensor reusing the same device address
+    // cannot inherit a stale plan and compute with the wrong host weights.
+    typedef void (*ggml_backend_sched_moe_cache_abandon_fn)(void);
+    GGML_API void ggml_backend_sched_set_moe_cache_abandon_hook(ggml_backend_sched_moe_cache_abandon_fn fn);
 
     //
     // Meta backend

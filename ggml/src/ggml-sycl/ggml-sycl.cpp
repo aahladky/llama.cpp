@@ -82,7 +82,28 @@
 // the same interface -- a weak extern cannot be satisfied across a
 // dlopen boundary.
 static volatile size_t g_moe_cache_budget_bytes = 0;
+// Per-device overrides. -1 sentinel (as size_t max) means "not set for
+// this device": fall back to the uniform budget. Cards in one box are
+// rarely the same size, so a single budget is either wasteful on the big
+// card or an OOM on the small one.
+static constexpr size_t MOE_CACHE_BUDGET_UNSET = (size_t) -1;
+static volatile size_t g_moe_cache_budget_per_device[GGML_SYCL_MAX_DEVICES] = {};
+static volatile bool   g_moe_cache_budget_per_device_set = false;
 static volatile size_t g_moe_cache_admission = 1;
+
+// The budget this device should use: its own when the caller supplied a
+// per-device map, otherwise the uniform one.
+static size_t moe_cache_budget_for_device(int device) {
+    if (g_moe_cache_budget_per_device_set
+            && device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        const size_t v = g_moe_cache_budget_per_device[device];
+        if (v != MOE_CACHE_BUDGET_UNSET) {
+            return v;
+        }
+    }
+    return g_moe_cache_budget_bytes;
+}
+
 static volatile char   g_moe_cache_policy[16] = "lru";
 static volatile bool   g_moe_cache_prefill_admit = false;
 // Last phase the server announced. Cache creation is lazy (the first
@@ -4367,6 +4388,15 @@ static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_ten
            dst->src[1]->ne[1] <= 8 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
+// Scheduler input copies (named "<backend>#<src>#<idx>") are refilled
+// from the host on every graph run -- with or without the cache hook.
+// A one-time in-place reorder with a sticky flag would make later runs'
+// raw restaged bytes be read as reordered. Model-owned weight tensors
+// never contain '#', so the name is a reliable discriminator.
+static bool is_sched_input_copy(const ggml_tensor * t) {
+    return strchr(t->name, '#') != nullptr;
+}
+
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                             ggml_tensor * dst, mul_mat_algo mm_algorithm) {
     if (!should_reorder_tensor(*ctx, dst)) {
@@ -4376,6 +4406,9 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (!extra || extra->optimized_feature.reorder) {
         return;  // Skip permutations and already reordered tensors
+    }
+    if (is_sched_input_copy(src0)) {
+        return;
     }
 
     switch (mm_algorithm) {
@@ -4411,6 +4444,20 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (!extra || extra->optimized_feature.reorder) {
+        return;
+    }
+    // A tensor the cache hook stages into is refilled with raw
+    // GGUF-layout bytes every graph run; a one-time in-place reorder with
+    // a sticky flag would make fused kernels read those raw bytes as
+    // reordered from the second decode step on. Skipping the optimization
+    // is always safe; reordering here is not. Two detectors: the sched
+    // copy-name pattern covers every restaged tensor even with no cache
+    // configured (no hook registered), the staged-base set is the
+    // authoritative record where the hook runs.
+    if (is_sched_input_copy(src0)) {
+        return;
+    }
+    if (ctx->moe_cache && ctx->moe_cache->is_staged_base(src0->data)) {
         return;
     }
     if (reorder_qw(src0, ctx->stream())) {
@@ -4704,9 +4751,13 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     int layer = moe_cache_parse_layer(tensor_name);
     if (layer < 0) return;
 
-    // Total budget comes from server-configured state (see
-    // ggml_backend_moe_cache_configure_v1).
-    if (g_moe_cache_budget_bytes == 0) return;
+    // Budget comes from server-configured state (see
+    // ggml_backend_moe_cache_configure_v1) -- this device's own when a
+    // per-device map was supplied, else the uniform one. Zero means no
+    // cache on this device, which under a per-device map is the explicit
+    // answer for every device the map does not name.
+    const size_t device_budget = moe_cache_budget_for_device(ctx.device);
+    if (device_budget == 0) return;
 
     std::lock_guard<std::mutex> lock(g_moe_cache_registry_mutex);
 
@@ -4735,7 +4786,7 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
 
     moe_cache_config cfg;
     cfg.device_id = ctx.device;
-    cfg.budget_bytes = g_moe_cache_budget_bytes;
+    cfg.budget_bytes = device_budget;
     cfg.n_layers = 256;  // generous upper bound; actual layers are sparse
     cfg.n_experts = n_experts;  // per-projection expert count
     cfg.policy = (const char *)g_moe_cache_policy;
@@ -4760,19 +4811,34 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     }
 }
 
-// Global hybrid metrics (accumulated across all layers). GPU-hit/CPU-miss
-// hybrid execution: under --moe-hybrid-mode, a miss the cache
+// Per-device hybrid metrics (accumulated across all layers). GPU-hit/
+// CPU-miss hybrid execution: under --moe-hybrid-mode, a miss the cache
 // declines to admit is NOT staged to the device at all -- its rows execute
 // on CPU inside ggml_sycl_mul_mat_id over the original host weights, and
 // h2d_bytes_avoided counts the transfers that never happened.
-static std::atomic<int64_t> g_hybrid_hit_rows{0};
-static std::atomic<int64_t> g_hybrid_miss_rows{0};
-static std::atomic<int64_t> g_hybrid_gpu_fallback_rows{0};
-static std::atomic<double>  g_hybrid_cpu_miss_time_ms{0.0};
-static std::atomic<double>  g_hybrid_gpu_hit_time_ms{0.0};
-static std::atomic<double>  g_hybrid_merge_time_ms{0.0};
-static std::atomic<int64_t> g_hybrid_h2d_bytes_avoided{0};
-static std::atomic<int64_t> g_hybrid_staging_skips{0};
+//
+// Per-device, not process-global: collect_stats emits one JSON object per
+// device, and a global counter repeated in every object double-counts as
+// soon as Prometheus sum()s over the device label.
+struct moe_hybrid_device_counters {
+    std::atomic<int64_t> hit_rows{0};
+    std::atomic<int64_t> miss_rows{0};
+    std::atomic<int64_t> gpu_fallback_rows{0};
+    std::atomic<double>  cpu_miss_time_ms{0.0};
+    std::atomic<double>  gpu_hit_time_ms{0.0};   // not yet measured (kernels are async); kept for schema stability
+    std::atomic<double>  merge_time_ms{0.0};
+    std::atomic<int64_t> h2d_bytes_avoided{0};
+    std::atomic<int64_t> staging_skips{0};
+};
+static moe_hybrid_device_counters g_hybrid_counters[GGML_SYCL_MAX_DEVICES];
+
+// std::atomic<double> has no fetch_add before C++20; a plain
+// `x = x.load() + v` is a lost-update race between two contexts.
+static void moe_hybrid_time_add(std::atomic<double> & a, double v) {
+    double cur = a.load(std::memory_order_relaxed);
+    while (!a.compare_exchange_weak(cur, cur + v)) {
+    }
+}
 
 // Worker count for the CPU tier: leave two cores for the SYCL runtime
 // and the server threads. The gemvs are dequant-heavy, and the tier
@@ -4809,6 +4875,14 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     int proj  = moe_cache_parse_projection(tensor_name);
     if (layer < 0 || proj < 0) return false;
 
+    // Whatever happens below -- hit, promote, hybrid skip, learning pass,
+    // or fall-through to the scheduler's plain copy -- this device base is
+    // refilled with raw GGUF-layout bytes this run and on every future
+    // run. Note it before any branch so opt_for_reorder_id never in-place
+    // reorders it (the reorder flag is sticky; restaged raw bytes would
+    // then be read as reordered).
+    ctx->moe_cache->note_staged_base(dst - (size_t) expert_id * expert_bytes);
+
     // Learning pass: feed the observation (projection size + tensor
     // identity) and stage the copy normally. Caching starts once one full
     // graph pass has shown every projection that exists.
@@ -4840,9 +4914,13 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
         // Cache hit: copy from cache slot to dst (GPU-to-GPU).
         // dst is input_cpy->data + eid * expert_size.
         // The compute kernel will read from input_cpy as usual.
-        q->memcpy(dst, cached, expert_bytes);
+        // SYCL_CHECK, not bare submissions: an exception here would
+        // otherwise escape through the scheduler's C hook boundary
+        // straight to std::terminate with no location.
+        SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(dst, cached, expert_bytes)));
         if (padding > 0) {
-            q->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                q->memcpy(dst + expert_bytes, host_src + expert_bytes, padding)));
         }
         return true;
     }
@@ -4852,9 +4930,10 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     void * slot = ctx->moe_cache->promote_projection(layer, expert_id, proj,
                                                       host_src, expert_bytes);
     if (slot) {
-        q->memcpy(dst, slot, expert_bytes);
+        SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(dst, slot, expert_bytes)));
         if (padding > 0) {
-            q->memcpy(dst + expert_bytes, host_src + expert_bytes, padding);
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                q->memcpy(dst + expert_bytes, host_src + expert_bytes, padding)));
         }
         return true;
     }
@@ -4865,7 +4944,14 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     // copy entirely and record the expert for CPU-tier execution inside
     // the op. ggml_sycl_mul_mat_id takes the plan keyed by the
     // staged tensor's device base.
-    if (g_moe_hybrid_mode && moe_cpu_can_execute(wtype)) {
+    //
+    // Only when the miss was ELIGIBLE for admission, though. During
+    // prefill with prefill-admission off, every promotion is declined by
+    // phase policy, not pressure -- skipping then would execute the
+    // whole prompt's routed rows as scalar CPU GEMVs, orders of
+    // magnitude slower than just staging. Stage normally instead.
+    if (g_moe_hybrid_mode && moe_cpu_can_execute(wtype)
+            && !ctx->moe_cache->admission_blocked_by_phase()) {
         const void * cpy_base = dst - (size_t) expert_id * expert_bytes;
         ctx->moe_cache->hybrid_record_skip(cpy_base, expert_id, host_src, wtype);
         // MMQ kernels read up to 512 bytes past the previous expert's
@@ -4874,9 +4960,10 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
         // scheduler's fallback copy only pads the last of a contiguous
         // run), so stage this expert's head from host to keep that
         // over-read NaN-free. 512 bytes, not the multi-megabyte expert.
-        q->memcpy(dst, host_src, std::min(expert_bytes, (size_t) 512));
-        g_hybrid_h2d_bytes_avoided += expert_bytes;
-        g_hybrid_staging_skips += 1;
+        SYCL_CHECK(CHECK_TRY_ERROR(
+            q->memcpy(dst, host_src, std::min(expert_bytes, (size_t) 512))));
+        g_hybrid_counters[ctx->device].h2d_bytes_avoided += expert_bytes;
+        g_hybrid_counters[ctx->device].staging_skips += 1;
         return true;
     }
 
@@ -4887,6 +4974,23 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
 
 // (Hybrid metrics globals are declared above moe_cache_hook_copy, which
 // updates them at staging time.)
+
+// Scheduler abandon hook: a graph died mid-compute, so pending hybrid
+// plans recorded for its staged inputs will never be taken. Purge every
+// device cache's plans before the next graph can stage into the same
+// addresses.
+static void moe_cache_abandon_pending(void) {
+    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+        std::shared_ptr<moe_expert_cache> cache;
+        {
+            std::lock_guard<std::mutex> lock(g_moe_cache_registry_mutex);
+            cache = g_moe_cache_registry[dev].lock();
+        }
+        if (cache) {
+            cache->hybrid_purge_plans();
+        }
+    }
+}
 
 // Collect cache stats from all initialized caches.
 //
@@ -4914,17 +5018,17 @@ std::string moe_cache_collect_stats() {
             if (stats.front() == '{') stats = stats.substr(1);
             if (stats.back() == '}') stats.pop_back();
             result += "{\"device\":\"SYCL" + std::to_string(dev) + "\"," + stats;
-            // Append hybrid metrics.  cpu_miss_time_ms / h2d_bytes_avoided
-            // are always 0: no CPU-miss execution exists yet, so no CPU time
-            // is spent and no H2D bytes are avoided.
-            result += ",\"hit_rows\":" + std::to_string(g_hybrid_hit_rows.load());
-            result += ",\"miss_rows\":" + std::to_string(g_hybrid_miss_rows.load());
-            result += ",\"gpu_fallback_rows\":" + std::to_string(g_hybrid_gpu_fallback_rows.load());
-            result += ",\"cpu_miss_time_ms\":" + std::to_string(g_hybrid_cpu_miss_time_ms.load());
-            result += ",\"gpu_hit_time_ms\":" + std::to_string(g_hybrid_gpu_hit_time_ms.load());
-            result += ",\"merge_time_ms\":" + std::to_string(g_hybrid_merge_time_ms.load());
-            result += ",\"h2d_bytes_avoided\":" + std::to_string(g_hybrid_h2d_bytes_avoided.load());
-            result += ",\"staging_skips\":" + std::to_string(g_hybrid_staging_skips.load());
+            // Append this device's hybrid metrics (see the counter struct
+            // for why they are per-device).
+            const moe_hybrid_device_counters & hc = g_hybrid_counters[dev];
+            result += ",\"hit_rows\":" + std::to_string(hc.hit_rows.load());
+            result += ",\"miss_rows\":" + std::to_string(hc.miss_rows.load());
+            result += ",\"gpu_fallback_rows\":" + std::to_string(hc.gpu_fallback_rows.load());
+            result += ",\"cpu_miss_time_ms\":" + std::to_string(hc.cpu_miss_time_ms.load());
+            result += ",\"gpu_hit_time_ms\":" + std::to_string(hc.gpu_hit_time_ms.load());
+            result += ",\"merge_time_ms\":" + std::to_string(hc.merge_time_ms.load());
+            result += ",\"h2d_bytes_avoided\":" + std::to_string(hc.h2d_bytes_avoided.load());
+            result += ",\"staging_skips\":" + std::to_string(hc.staging_skips.load());
             result += "}";
         }
     }
@@ -4975,7 +5079,20 @@ static void ggml_backend_sycl_moe_cache_configure_v1(const struct ggml_backend_m
     g_moe_cache_prefill_admit = cfg->prefill_admit;
     snprintf((char *) g_moe_cache_policy, sizeof(g_moe_cache_policy), "%s",
              cfg->policy ? cfg->policy : "lru");
+
+    for (int i = 0; i < GGML_SYCL_MAX_DEVICES; i++) {
+        g_moe_cache_budget_per_device[i] = MOE_CACHE_BUDGET_UNSET;
+    }
+    g_moe_cache_budget_per_device_set = false;
+    if (cfg->per_device_bytes && cfg->n_per_device > 0) {
+        const int n = std::min(cfg->n_per_device, GGML_SYCL_MAX_DEVICES);
+        for (int i = 0; i < n; i++) {
+            g_moe_cache_budget_per_device[i] = cfg->per_device_bytes[i];
+        }
+        g_moe_cache_budget_per_device_set = true;
+    }
 }
+
 
 static int ggml_backend_sycl_moe_cache_reset_all_v1(void) {
     return moe_cache_reset_all();
@@ -5108,6 +5225,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
         }
 
+        // Row accounting happens here, not inside the CPU-tier block: an
+        // all-GPU batch under hybrid mode must still count (as hits when a
+        // plan was taken, as fallback when no plan exists), or the metrics
+        // understate exactly the healthy case.
+        if (g_moe_hybrid_mode && ctx.moe_cache && ctx.moe_cache_enabled) {
+            moe_hybrid_device_counters & hc = g_hybrid_counters[ctx.device];
+            if (hplan.empty()) {
+                hc.gpu_fallback_rows += (int64_t) gpu_rows.size();
+            } else {
+                hc.hit_rows += (int64_t) gpu_rows.size();
+            }
+        }
+
         std::vector<float> cpu_acts;
         if (!cpu_rows.empty()) {
             // CPU tier reads f32 activations and writes f32 outputs; the
@@ -5154,13 +5284,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                     cpu_outs.data() + k * (size_t) ne0,
                     ne0 * sizeof(float))));
             }
+            // The copies queue behind every pending gemv on this in-order
+            // queue, but cpu_outs dies at scope exit: without this wait the
+            // copy engine reads freed (and typically reused) host memory --
+            // silent logit corruption, not a crash.
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
             const auto t_mrg = std::chrono::steady_clock::now();
-            g_hybrid_miss_rows += (int64_t) cpu_rows.size();
-            g_hybrid_hit_rows += (int64_t) gpu_rows.size();
-            g_hybrid_cpu_miss_time_ms = g_hybrid_cpu_miss_time_ms.load() +
-                std::chrono::duration<double, std::milli>(t_cpu1 - t_cpu0).count();
-            g_hybrid_merge_time_ms = g_hybrid_merge_time_ms.load() +
-                std::chrono::duration<double, std::milli>(t_mrg - t_cpu1).count();
+            moe_hybrid_device_counters & hc = g_hybrid_counters[ctx.device];
+            hc.miss_rows += (int64_t) cpu_rows.size();
+            moe_hybrid_time_add(hc.cpu_miss_time_ms,
+                std::chrono::duration<double, std::milli>(t_cpu1 - t_cpu0).count());
+            moe_hybrid_time_add(hc.merge_time_ms,
+                std::chrono::duration<double, std::milli>(t_mrg - t_cpu1).count());
         }
     } else {
         const int64_t n_routed_rows = ids->ne[1] * n_ids;
@@ -5263,9 +5398,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
             if (hybrid_active) {
                 if (hplan.empty()) {
-                    g_hybrid_gpu_fallback_rows += num_src1_rows;
+                    g_hybrid_counters[ctx.device].gpu_fallback_rows += num_src1_rows;
                 } else {
-                    g_hybrid_hit_rows += num_src1_rows;
+                    g_hybrid_counters[ctx.device].hit_rows += num_src1_rows;
                 }
             }
         }
@@ -5310,12 +5445,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                     (size_t) ce.n_rows * ne0 * sizeof(float))));
                 at += (size_t) ce.n_rows;
             }
+            // cpu_outs dies at scope exit; the copies must land before it
+            // does (same reason as the pre-gemv wait above).
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
             const auto t_mrg = std::chrono::steady_clock::now();
-            g_hybrid_miss_rows += cpu_row_total;
-            g_hybrid_cpu_miss_time_ms = g_hybrid_cpu_miss_time_ms.load() +
-                std::chrono::duration<double, std::milli>(t_cpu1 - t_cpu0).count();
-            g_hybrid_merge_time_ms = g_hybrid_merge_time_ms.load() +
-                std::chrono::duration<double, std::milli>(t_mrg - t_cpu1).count();
+            moe_hybrid_device_counters & hc = g_hybrid_counters[ctx.device];
+            hc.miss_rows += cpu_row_total;
+            moe_hybrid_time_add(hc.cpu_miss_time_ms,
+                std::chrono::duration<double, std::milli>(t_cpu1 - t_cpu0).count());
+            moe_hybrid_time_add(hc.merge_time_ms,
+                std::chrono::duration<double, std::milli>(t_mrg - t_cpu1).count());
         }
 
         {
@@ -7108,8 +7247,16 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
     // cache budget was configured (the server sets the globals from CLI
     // args before backend init); with a zero budget the per-expert hook
     // loop would be pure overhead.
-    if (g_moe_cache_budget_bytes > 0) {
+    // Any nonzero budget -- uniform or on any single device -- means the
+    // hook must run; only a fully zero configuration can skip it.
+    bool any_budget = g_moe_cache_budget_bytes > 0;
+    for (int i = 0; !any_budget && i < GGML_SYCL_MAX_DEVICES; i++) {
+        const size_t v = g_moe_cache_budget_per_device[i];
+        any_budget = (v != MOE_CACHE_BUDGET_UNSET && v > 0);
+    }
+    if (any_budget) {
         ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
+        ggml_backend_sched_set_moe_cache_abandon_hook(moe_cache_abandon_pending);
     }
 #endif
 

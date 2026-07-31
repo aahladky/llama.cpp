@@ -2695,7 +2695,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             backends_json += "]";
 
             printf("{\n");
-            printf("  \"schema\": 2,\n");
+            printf("  \"schema\": 3,\n");
             printf("  \"backend\": \"llama.cpp\",\n");
             printf("  \"build\": {\n");
             printf("    \"commit\": \"%s\",\n", llama_commit());
@@ -2734,7 +2734,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             printf("    \"moe_cache_prefill_policy\": %s,\n", moe_cache_prefill_policy ? "true" : "false");
             printf("    \"moe_cache_reset\": %s,\n", moe_cache_reset ? "true" : "false");
             printf("    \"moe_cache_prefetch\": %s,\n", moe_cache_prefetch ? "true" : "false");
-            printf("    \"moe_offload_threshold_control\": %s\n", moe_offload_threshold_control ? "true" : "false");
+            printf("    \"moe_offload_threshold_control\": %s,\n", moe_offload_threshold_control ? "true" : "false");
+            // Schema 3: --moe-cache-bytes accepts a per-device map
+            // (SYCL0=N,SYCL1=N) as well as a single uniform value. Tied
+            // to the cache itself: the map is parsed by this binary's
+            // arg handler and honoured by the same backend that
+            // implements the cache.
+            printf("    \"moe_cache_per_device_budgets\": %s\n", cache_implemented ? "true" : "false");
             printf("  },\n");
             // Constraints
             printf("  \"constraints\": {\n");
@@ -2745,9 +2751,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             // runtime will -- reporting a hardcoded 32 while the env var
             // changes the real threshold made the field a lie.
             {
+                // Mirror the backend's full fallback chain (MOE-specific
+                // env, then the generic offload env, then 32): with only
+                // GGML_OP_OFFLOAD_MIN_BATCH set, the runtime threshold is
+                // that value, and reporting 32 here made the field a lie.
                 const char * moe_env = getenv("GGML_OP_OFFLOAD_MOE_MIN_BATCH");
-                const int moe_min_batch =
-                    (moe_env && atoi(moe_env) > 0) ? atoi(moe_env) : 32;
+                const char * gen_env = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+                int moe_min_batch = 32;
+                if (gen_env && atoi(gen_env) > 0) {
+                    moe_min_batch = atoi(gen_env);
+                }
+                if (moe_env && atoi(moe_env) > 0) {
+                    moe_min_batch = atoi(moe_env);
+                }
                 printf("    \"moe_cache_min_batch\": %d,\n", moe_min_batch);
             }
             printf("    \"moe_cache_supported_projections\": [\"gate\", \"up\", \"down\"],\n");
@@ -2801,10 +2817,57 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-bytes"}, "N",
-        "per-GPU budget in bytes for MoE expert cache (0 = disabled)",
+        {"--moe-cache-bytes"}, "N|DEV=N[,DEV=N...]",
+        "budget in bytes for the MoE expert cache (0 = disabled). A bare "
+        "number applies to every GPU; the map form gives each device its "
+        "own budget (e.g. SYCL0=8589934592,SYCL1=2147483648) -- devices "
+        "not named get 0. Cards in one box are rarely the same size, and "
+        "a uniform budget is either wasteful on the big card or an OOM on "
+        "the small one.",
         [](common_params & params, const std::string & value) {
-            params.moe_cache_bytes = std::stoull(value);
+            if (value.find('=') == std::string::npos) {
+                params.moe_cache_bytes = std::stoull(value);
+                params.moe_cache_bytes_per_device.clear();
+                return;
+            }
+            // Map form: every device is explicit, so unnamed devices get
+            // no cache rather than silently inheriting a budget nobody
+            // reserved for them (which is what the control plane's
+            // placement math would then have to guess at).
+            params.moe_cache_bytes = 0;
+            params.moe_cache_bytes_per_device.clear();
+            size_t pos = 0;
+            while (pos <= value.size()) {
+                const size_t comma = value.find(',', pos);
+                const std::string item = value.substr(
+                    pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (!item.empty()) {
+                    const size_t eq = item.find('=');
+                    if (eq == std::string::npos) {
+                        throw std::invalid_argument(
+                            "expected DEVICE=BYTES, got '" + item + "'");
+                    }
+                    std::string dev = item.substr(0, eq);
+                    const std::string bytes = item.substr(eq + 1);
+                    // Accept "SYCL0" or a bare index; the device prefix is
+                    // what modelctl and --device already speak.
+                    size_t digits = dev.find_first_of("0123456789");
+                    if (digits == std::string::npos) {
+                        throw std::invalid_argument(
+                            "no device index in '" + dev + "'");
+                    }
+                    const int index = std::stoi(dev.substr(digits));
+                    if (index < 0) {
+                        throw std::invalid_argument("negative device index");
+                    }
+                    params.moe_cache_bytes_per_device[index] = std::stoull(bytes);
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+            if (params.moe_cache_bytes_per_device.empty()) {
+                throw std::invalid_argument("no device budgets parsed");
+            }
         }
     ));
     add_opt(common_arg(
