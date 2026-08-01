@@ -4505,6 +4505,17 @@ void server_routes::init_routes() {
                             }
                         }
                     }
+
+                    // Bool, so not in the table above (its rows extract
+                    // uint64/double). 1 while the cache is still learning
+                    // projection geometry and serving nothing.
+                    prometheus << "# HELP llamacpp:moe_cache_learning Cache is learning projection geometry\n"
+                               << "# TYPE llamacpp:moe_cache_learning gauge\n";
+                    for (const auto & dev_stats : cache_stats) {
+                        const std::string dev = dev_stats.value("device", "unknown");
+                        prometheus << "llamacpp:moe_cache_learning{device=\"" << dev << "\"} "
+                                   << (dev_stats.value("learning", false) ? 1 : 0) << "\n";
+                    }
                 } catch (...) {
                     // JSON parse failure — skip cache metrics.
                 }

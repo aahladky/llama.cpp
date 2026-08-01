@@ -5008,7 +5008,11 @@ std::string moe_cache_collect_stats() {
             std::lock_guard<std::mutex> lock(g_moe_cache_registry_mutex);
             cache = g_moe_cache_registry[dev].lock();
         }
-        if (cache && cache->is_initialized()) {
+        // Learning caches report too: a cache waiting on geometry used to
+        // be invisible here, so /metrics showed nothing at all and "still
+        // learning" was indistinguishable from "no cache configured".
+        // stats_json() is safe pre-init and carries a "learning" field.
+        if (cache) {
             if (!first) result += ",";
             first = false;
             // stats_json() returns {"hits":N,...} — strip outer braces
