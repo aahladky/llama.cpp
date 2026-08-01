@@ -33,6 +33,19 @@ list(APPEND GGML_SOURCES_SYCL ${SRCS})
 target_sources(ggml-sycl PRIVATE ${GGML_HEADERS_SYCL} ${GGML_SOURCES_SYCL})
 target_compile_definitions(ggml-sycl PRIVATE GGML_MOE_EXPERT_CACHE)
 
+# The hybrid CPU miss tier computes over host weights, which is exactly
+# what ggml-cpu's quantized vec_dot kernels are for -- they read the
+# quantized blocks directly instead of materializing f32 rows, which the
+# miss-path profile showed was two thirds of its cost. Backends normally
+# link only ggml-base, so this is a deliberate extra edge, and moe-hybrid
+# .cpp keeps a working dequantize path for builds that do not have it
+# (CPU backend off, or the multi-variant DL build where no plain
+# ggml-cpu target exists).
+if (TARGET ggml-cpu)
+    target_link_libraries(ggml-sycl PRIVATE ggml-cpu)
+    target_compile_definitions(ggml-sycl PRIVATE GGML_MOE_HYBRID_CPU_KERNELS)
+endif()
+
 if (WIN32)
     # To generate a Visual Studio solution, using Intel C++ Compiler for ggml-sycl is mandatory
     if( ${CMAKE_GENERATOR} MATCHES "Visual Studio" AND NOT (${CMAKE_GENERATOR_TOOLSET} MATCHES "Intel C"))

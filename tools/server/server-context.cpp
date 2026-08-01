@@ -4501,6 +4501,47 @@ void server_routes::init_routes() {
                         { "llamacpp:moe_hybrid_merge_time_ms",
                           "Cumulative CPU-result merge (H2D) submit time", "counter",
                           "merge_time_ms", true },
+                        // Miss-path profile. The ns breakdown below is
+                        // recorded only under GGML_MOE_HYBRID_PROFILE=1;
+                        // moe_hybrid_cpu_profiled_rows_total says how many
+                        // of the weight rows it covers.
+                        { "llamacpp:moe_hybrid_cpu_tier_calls_total",
+                          "CPU-tier batch executions", "counter",
+                          "cpu_tier_calls", false },
+                        { "llamacpp:moe_hybrid_cpu_tier_jobs_total",
+                          "Expert gemvs issued to the CPU tier", "counter",
+                          "cpu_tier_jobs", false },
+                        { "llamacpp:moe_hybrid_cpu_weight_rows_total",
+                          "Weight rows the CPU tier computed", "counter",
+                          "cpu_weight_rows", false },
+                        { "llamacpp:moe_hybrid_cpu_kernel_rows_total",
+                          "Weight rows computed by ggml-cpu's quantized kernels "
+                          "rather than dequantize-and-dot", "counter",
+                          "cpu_kernel_rows", false },
+                        { "llamacpp:moe_hybrid_cpu_weight_bytes_total",
+                          "Quantized weight bytes the CPU tier read", "counter",
+                          "cpu_weight_bytes", false },
+                        { "llamacpp:moe_hybrid_cpu_threads_used",
+                          "High-water CPU-tier worker count", "gauge",
+                          "cpu_threads_used", false },
+                        { "llamacpp:moe_hybrid_cpu_wall_ns_total",
+                          "Wall time inside the CPU tier", "counter",
+                          "cpu_wall_ns", false },
+                        { "llamacpp:moe_hybrid_cpu_dispatch_ns_total",
+                          "CPU-tier time spent getting workers running", "counter",
+                          "cpu_dispatch_ns", false },
+                        { "llamacpp:moe_hybrid_cpu_dequant_ns_total",
+                          "CPU-tier time spent dequantizing weights", "counter",
+                          "cpu_dequant_ns", false },
+                        { "llamacpp:moe_hybrid_cpu_matmul_ns_total",
+                          "CPU-tier time spent in the dot products", "counter",
+                          "cpu_matmul_ns", false },
+                        { "llamacpp:moe_hybrid_cpu_quant_act_ns_total",
+                          "CPU-tier time spent quantizing activations", "counter",
+                          "cpu_quant_act_ns", false },
+                        { "llamacpp:moe_hybrid_cpu_profiled_rows_total",
+                          "Weight rows the ns breakdown covers", "counter",
+                          "cpu_profiled_rows", false },
                     };
 
                     for (const auto & m : metrics) {

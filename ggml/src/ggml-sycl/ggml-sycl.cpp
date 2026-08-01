@@ -4848,6 +4848,9 @@ struct moe_hybrid_device_counters {
     std::atomic<double>  merge_time_ms{0.0};
     std::atomic<int64_t> h2d_bytes_avoided{0};
     std::atomic<int64_t> staging_skips{0};
+    // Miss-path profile: where the CPU tier's time actually goes. Same
+    // per-device reasoning as the counters above.
+    moe_cpu_tier_counters cpu_tier;
 };
 static moe_hybrid_device_counters g_hybrid_counters[GGML_SYCL_MAX_DEVICES];
 
@@ -4859,12 +4862,13 @@ static void moe_hybrid_time_add(std::atomic<double> & a, double v) {
     }
 }
 
-// Worker count for the CPU tier: leave two cores for the SYCL runtime
-// and the server threads. The gemvs are dequant-heavy, and the tier
-// single-threaded measurably lost to the transfers it replaced.
+// Worker count for the CPU tier. The tier owns a persistent pool that
+// already leaves cores for the SYCL runtime and the server threads, so
+// this asks it rather than deriving a second, smaller limit -- the old
+// hard cap of 16 left ten of this machine's threads idle once the tier
+// became fast enough for the extra width to matter.
 static int moe_cpu_tier_threads() {
-    static const int n = std::max(1, std::min(16,
-        (int) std::thread::hardware_concurrency() - 2));
+    static const int n = moe_cpu_tier_max_threads();
     return n;
 }
 
@@ -5077,6 +5081,23 @@ std::string moe_cache_collect_stats() {
             result += ",\"merge_time_ms\":" + std::to_string(hc.merge_time_ms.load());
             result += ",\"h2d_bytes_avoided\":" + std::to_string(hc.h2d_bytes_avoided.load());
             result += ",\"staging_skips\":" + std::to_string(hc.staging_skips.load());
+            // Miss-path profile. The ns breakdown is zero unless
+            // GGML_MOE_HYBRID_PROFILE=1; cpu_profiled_rows says how much
+            // of cpu_weight_rows it covers, so zero cannot be misread as
+            // "no time spent".
+            const moe_cpu_tier_stats ts = moe_cpu_tier_snapshot(hc.cpu_tier);
+            result += ",\"cpu_tier_calls\":" + std::to_string(ts.calls);
+            result += ",\"cpu_tier_jobs\":" + std::to_string(ts.jobs);
+            result += ",\"cpu_weight_rows\":" + std::to_string(ts.weight_rows);
+            result += ",\"cpu_kernel_rows\":" + std::to_string(ts.kernel_rows);
+            result += ",\"cpu_weight_bytes\":" + std::to_string(ts.weight_bytes);
+            result += ",\"cpu_threads_used\":" + std::to_string(ts.threads_used);
+            result += ",\"cpu_wall_ns\":" + std::to_string(ts.wall_ns);
+            result += ",\"cpu_dispatch_ns\":" + std::to_string(ts.dispatch_ns);
+            result += ",\"cpu_dequant_ns\":" + std::to_string(ts.dequant_ns);
+            result += ",\"cpu_matmul_ns\":" + std::to_string(ts.matmul_ns);
+            result += ",\"cpu_quant_act_ns\":" + std::to_string(ts.quant_act_ns);
+            result += ",\"cpu_profiled_rows\":" + std::to_string(ts.profiled_rows);
             result += "}";
         }
     }
@@ -5287,17 +5308,35 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
 
         std::vector<float> cpu_acts;
+        std::vector<size_t> cpu_act_slot(cpu_rows.size(), 0);
         if (!cpu_rows.empty()) {
             // CPU tier reads f32 activations and writes f32 outputs; the
             // graphs this runs in always satisfy that, and the unstaged
             // weights leave no fallback if it were ever violated.
             GGML_ASSERT(src1->type == GGML_TYPE_F32);
             GGML_ASSERT(dst->type == GGML_TYPE_F32);
-            cpu_acts.resize(cpu_rows.size() * (size_t) ne10);
+            // One copy per distinct source row, not per miss. At decode
+            // every expert a token routed to reads the same activation,
+            // so this is n_expert_used device-to-host copies collapsed
+            // into one -- and one activation quantization downstream
+            // instead of one per expert.
+            std::vector<const char *> act_srcs;
+            act_srcs.reserve(cpu_rows.size());
             for (size_t k = 0; k < cpu_rows.size(); k++) {
+                size_t slot = act_srcs.size();
+                for (size_t s = 0; s < act_srcs.size(); s++) {
+                    if (act_srcs[s] == cpu_rows[k].act_dev) { slot = s; break; }
+                }
+                if (slot == act_srcs.size()) {
+                    act_srcs.push_back(cpu_rows[k].act_dev);
+                }
+                cpu_act_slot[k] = slot;
+            }
+            cpu_acts.resize(act_srcs.size() * (size_t) ne10);
+            for (size_t s = 0; s < act_srcs.size(); s++) {
                 SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
-                    cpu_acts.data() + k * (size_t) ne10,
-                    cpu_rows[k].act_dev, ne10 * sizeof(float))));
+                    cpu_acts.data() + s * (size_t) ne10,
+                    act_srcs[s], ne10 * sizeof(float))));
             }
             SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
         }
@@ -5315,7 +5354,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             std::vector<moe_cpu_gemv_job> jobs(cpu_rows.size());
             for (size_t k = 0; k < cpu_rows.size(); k++) {
                 jobs[k] = {cpu_rows[k].host_w,
-                           cpu_acts.data() + k * (size_t) ne10,
+                           cpu_acts.data() + cpu_act_slot[k] * (size_t) ne10,
                            cpu_outs.data() + k * (size_t) ne0};
             }
             // The skip decision already verified the type; a failure here
@@ -5323,7 +5362,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             // be loud, not wrong.
             const bool ok = moe_cpu_execute_gemvs(
                 jobs.data(), jobs.size(), (int) src0->type, ne00, ne01,
-                moe_cpu_tier_threads());
+                moe_cpu_tier_threads(), &g_hybrid_counters[ctx.device].cpu_tier);
             GGML_ASSERT(ok && "hybrid CPU tier failed after staging was skipped");
             const auto t_cpu1 = std::chrono::steady_clock::now();
             for (size_t k = 0; k < cpu_rows.size(); k++) {
@@ -5482,7 +5521,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
             const bool ok = moe_cpu_execute_gemvs(
                 jobs.data(), jobs.size(), (int) src0->type, ne00, ne01,
-                moe_cpu_tier_threads());
+                moe_cpu_tier_threads(), &g_hybrid_counters[ctx.device].cpu_tier);
             GGML_ASSERT(ok && "hybrid CPU tier failed after staging was skipped");
             const auto t_cpu1 = std::chrono::steady_clock::now();
             at = 0;

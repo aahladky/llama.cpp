@@ -13,6 +13,11 @@
 
 #include "ggml-sycl/moe-hybrid.hpp"
 
+#ifdef GGML_MOE_HYBRID_CPU_KERNELS
+#include "ggml-cpu.h"
+#endif
+
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -354,11 +359,20 @@ static void test_cpu_misses_match_the_f32_reference() {
 
 static void test_cpu_misses_dequantize_with_ggml_math() {
     // Quantize a known f32 fixture with ggml's own quantizer, run the
-    // executor over the quantized blocks, and compare against the
-    // dequantized reference computed independently here. This pins the
-    // plumbing (row size, expert stride, partition order) AND that the
-    // executor uses ggml's dequantizer rather than reinterpreting blocks
-    // as floats -- defect 4 of the old scaffold.
+    // executor over the quantized blocks, and compare against a reference
+    // computed independently here. This pins the plumbing (row size,
+    // expert stride, partition order) AND that the executor does real
+    // quantized math rather than reinterpreting blocks as floats --
+    // defect 4 of the old scaffold.
+    //
+    // Which reference depends on what the executor is built to use. With
+    // ggml-cpu's kernels linked it computes an integer dot against the
+    // activation quantized to vec_dot_type, so the exact reference is
+    // dequantized weights against the DEQUANTIZED-REQUANTIZED activation;
+    // holding it to the f32 activation instead would only measure the
+    // quantizer's error. Without them it dequantizes and dots in f64, and
+    // the f32 activation is exact. Both bars are tight enough that block
+    // reinterpretation fails them by orders of magnitude.
     CASE("G3: quantized miss execution goes through ggml's dequantizer");
     const int64_t ne00 = 256;  // one Q4_K / Q8_0 superblock multiple
     const int64_t ne01 = 3;
@@ -389,13 +403,44 @@ static void test_cpu_misses_dequantize_with_ggml_math() {
         // Independent reference: dequantize with the public traits and dot.
         const auto * traits = ggml_get_type_traits(type);
         std::vector<float> row((size_t)ne00);
+#ifdef GGML_MOE_HYBRID_CPU_KERNELS
+        // The kernel dots the weights against the activation quantized to
+        // vec_dot_type, so it cannot equal the f32 reference. The gap is
+        // bounded, though: an int8 quantizer with a per-block scale puts
+        // every element within (max|act| / 254) of the original, and the
+        // dot's error is at most that times sum|w|. That bound is a few
+        // parts in ten thousand of the value here -- reinterpreting the
+        // blocks as floats misses it by three orders of magnitude, which
+        // is the thing this case exists to catch.
+        double act_max = 0.0;
+        for (int64_t j = 0; j < ne00; j++) {
+            act_max = std::max(act_max, (double)std::fabs(act[(size_t)j]));
+        }
+        const double act_step = act_max / 254.0;
+#endif
         for (int k = 0; k < 2; k++) {
             for (int64_t o = 0; o < ne01; o++) {
                 const uint8_t * wrow = q.data()
                     + (size_t)experts[k] * expert_bytes + (size_t)o * row_bytes;
                 traits->to_float(wrow, row.data(), ne00);
-                CHECK_NEAR(out[(size_t)k * ne01 + o],
-                           ref_dot(row.data(), act.data(), ne00));
+                const float ref = ref_dot(row.data(), act.data(), ne00);
+                const float got = out[(size_t)k * ne01 + o];
+#ifdef GGML_MOE_HYBRID_CPU_KERNELS
+                double w_abs = 0.0;
+                for (int64_t j = 0; j < ne00; j++) {
+                    w_abs += (double)std::fabs(row[(size_t)j]);
+                }
+                // x2 for rounding of the block scale itself.
+                const double tol = 2.0 * act_step * w_abs + 1e-5;
+                if (!(std::fabs((double)got - (double)ref) <= tol)) {
+                    fprintf(stderr, "FAIL [%s] %s:%d: %g != %g (tol %g)\n",
+                            g_case.c_str(), __FILE__, __LINE__,
+                            (double)got, (double)ref, tol);
+                    g_failures++;
+                }
+#else
+                CHECK_NEAR(got, ref);
+#endif
             }
         }
     }

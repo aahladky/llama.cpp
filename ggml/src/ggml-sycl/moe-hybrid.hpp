@@ -16,6 +16,7 @@
 #ifndef GGML_SYCL_MOE_HYBRID_HPP
 #define GGML_SYCL_MOE_HYBRID_HPP
 
+#include <atomic>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -175,13 +176,72 @@ struct moe_cpu_gemv_job {
     const float * activation; // ne00 floats
     float *       out;        // ne01 floats
 };
+
+// Miss-path counters, accumulated by moe_cpu_execute_gemvs into a caller-
+// owned block. Per-device rather than global: the SYCL metrics collector
+// emits one object per device, and a process-global counter repeated in
+// each one double-counts as soon as Prometheus sum()s over the label.
+//
+// The ns breakdown costs two clock reads per weight row and is recorded
+// only when GGML_MOE_HYBRID_PROFILE=1; the row/byte/thread counters are
+// one atomic add per call and are always on. profiled_rows says how many
+// rows the ns figures actually cover, so a mixed run cannot be read as if
+// the whole of it were timed.
+struct moe_cpu_tier_counters {
+    std::atomic<int64_t> calls{0};          // moe_cpu_execute_gemvs calls
+    std::atomic<int64_t> jobs{0};           // (expert, activation) pairs
+    std::atomic<int64_t> weight_rows{0};    // output rows computed
+    // Of those, the ones ggml-cpu's quantized kernels computed. Equal to
+    // weight_rows on a build that links them and a type they cover; zero
+    // says every row went the dequantize-and-dot way, which is roughly
+    // 25x slower and is otherwise invisible from outside.
+    std::atomic<int64_t> kernel_rows{0};
+    std::atomic<int64_t> weight_bytes{0};   // quantized weight bytes read
+    std::atomic<int64_t> threads_used{0};   // high-water worker count
+    std::atomic<int64_t> wall_ns{0};        // in-call wall time
+    std::atomic<int64_t> dispatch_ns{0};    // getting workers running
+    std::atomic<int64_t> dequant_ns{0};     // weight dequantization
+    std::atomic<int64_t> matmul_ns{0};      // the dot products
+    std::atomic<int64_t> quant_act_ns{0};   // activation quantization
+    std::atomic<int64_t> profiled_rows{0};  // rows the ns figures cover
+};
+
+// Plain snapshot of the above, for callers that only read.
+struct moe_cpu_tier_stats {
+    int64_t calls;
+    int64_t jobs;
+    int64_t weight_rows;
+    int64_t kernel_rows;
+    int64_t weight_bytes;
+    int64_t threads_used;
+    int64_t wall_ns;
+    int64_t dispatch_ns;
+    int64_t dequant_ns;
+    int64_t matmul_ns;
+    int64_t quant_act_ns;
+    int64_t profiled_rows;
+};
+moe_cpu_tier_stats moe_cpu_tier_snapshot(const moe_cpu_tier_counters & c);
+
+// Is the per-row ns breakdown being recorded? Read once from
+// GGML_MOE_HYBRID_PROFILE at first call.
+bool moe_cpu_profile_enabled();
+
+// Workers the tier can put on one batch, counting the caller. This is
+// the worker pool's own size -- it already leaves cores for the SYCL
+// runtime and the server, and already honours GGML_MOE_HYBRID_THREADS --
+// so callers should ask rather than compute their own limit.
+int moe_cpu_tier_max_threads();
+
+// stats may be null, in which case nothing is counted.
 bool moe_cpu_execute_gemvs(
     const moe_cpu_gemv_job * jobs,
     size_t        n_jobs,
     int           wtype,
     int64_t       ne00,
     int64_t       ne01,
-    int           n_threads);
+    int           n_threads,
+    moe_cpu_tier_counters * stats = nullptr);
 
 // Hybrid metrics for Prometheus export.
 struct moe_hybrid_metrics {

@@ -367,8 +367,27 @@ add_executable(test-moe-hybrid
     ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl/moe-cache.cpp)
 target_include_directories(test-moe-hybrid PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 target_link_libraries(test-moe-hybrid PRIVATE ggml-base Threads::Threads)
+if (TARGET ggml-cpu)
+    target_link_libraries(test-moe-hybrid PRIVATE ggml-cpu)
+    target_compile_definitions(test-moe-hybrid PRIVATE GGML_MOE_HYBRID_CPU_KERNELS)
+endif()
 add_test(NAME test-moe-hybrid COMMAND test-moe-hybrid)
 set_property(TEST test-moe-hybrid PROPERTY LABELS main)
+
+# Miss-path microbenchmark. Built with the tests because it shares their
+# host-only shape, but deliberately not registered with ctest: it is a
+# stopwatch, and a stopwatch in the suite makes the suite slow and its
+# result machine-dependent.
+add_executable(bench-moe-hybrid
+    bench-moe-hybrid.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl/moe-hybrid.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl/moe-cache.cpp)
+target_include_directories(bench-moe-hybrid PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+target_link_libraries(bench-moe-hybrid PRIVATE ggml-base Threads::Threads)
+if (TARGET ggml-cpu)
+    target_link_libraries(bench-moe-hybrid PRIVATE ggml-cpu)
+    target_compile_definitions(bench-moe-hybrid PRIVATE GGML_MOE_HYBRID_CPU_KERNELS)
+endif()
 
 # mmap advise bridge tests (P1: SSD/mmap-tier madvise management). Runs
 # the real llama_mmap against a temp file and asserts through /proc that
