@@ -44,6 +44,25 @@ void ggml_backend_sched_set_moe_cache_abandon_hook(ggml_backend_sched_moe_cache_
     s_moe_cache_abandon = fn;
 }
 
+// Fires once per completed compute_splits pass (one ubatch); the backend
+// flushes its per-step mmap advice batch here.  Abandon paths above drop
+// the batch via s_moe_cache_abandon instead of firing this.
+static ggml_backend_sched_moe_cache_step_end_fn s_moe_cache_step_end = nullptr;
+void ggml_backend_sched_set_moe_cache_step_end_hook(ggml_backend_sched_moe_cache_step_end_fn fn) {
+    s_moe_cache_step_end = fn;
+}
+
+// Bridge to the process's model-mapping owner (llama-mmap registers it).
+// Null means no live mapping has ever registered; callers treat null as
+// "advice unavailable".
+static ggml_backend_moe_mmap_advise_fn s_moe_mmap_advise = nullptr;
+void ggml_backend_moe_set_mmap_advise_fn(ggml_backend_moe_mmap_advise_fn fn) {
+    s_moe_mmap_advise = fn;
+}
+ggml_backend_moe_mmap_advise_fn ggml_backend_moe_get_mmap_advise_fn(void) {
+    return s_moe_mmap_advise;
+}
+
 
 // backend buffer type
 
@@ -1775,6 +1794,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+    }
+
+    if (s_moe_cache_step_end) {
+        s_moe_cache_step_end();
     }
 
     return GGML_STATUS_SUCCESS;

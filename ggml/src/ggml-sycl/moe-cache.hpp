@@ -37,6 +37,7 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -48,6 +49,18 @@
 // and how large each one is by OBSERVING real staged copies (see
 // observe_geometry) instead of assuming three equal components.
 #define MOE_CACHE_N_PROJECTIONS 3
+
+// Advice values passed to moe_cache_config::mmap_advise. Plain ints (not
+// the ggml-backend constants) so this header stays free of ggml includes
+// for the host-only tests; ggml-sycl.cpp static_asserts they match the
+// GGML_MOE_MMAP_ADVISE_* values.
+#define MOE_CACHE_MMAP_ADVISE_WILLNEED 1
+#define MOE_CACHE_MMAP_ADVISE_DONTNEED 2
+typedef void (*moe_cache_mmap_advise_fn)(const void * ptr, size_t len, int advice);
+
+// Per-step advice batches are bounded; entries past the cap are dropped
+// and counted (advise_dropped), never silently.
+#define MOE_CACHE_ADVISE_MAX_RANGES 4096
 
 // Parse the layer index from a routed-expert tensor name like
 // "blk.5.ffn_gate_exps". Returns -1 for anything that is not a routed
@@ -132,12 +145,19 @@ struct moe_cache_stats {
     std::atomic<uint64_t> decode_hits{0};
     std::atomic<uint64_t> slru_promotions{0};    // probationary -> protected
     std::atomic<uint64_t> slru_demotions{0};      // protected -> probationary
+    // mmap-tier advice calls issued (WILLNEED ranges are coalesced first,
+    // so willneed counts madvise calls, not miss events) and batch
+    // entries dropped at the per-step cap.
+    std::atomic<uint64_t> advise_willneed{0};
+    std::atomic<uint64_t> advise_dontneed{0};
+    std::atomic<uint64_t> advise_dropped{0};
 
     void reset() {
         hits = misses = evictions = promotions = 0;
         h2d_bytes = host_weight_copy_fallbacks = cache_served_projections = 0;
         prefill_misses = decode_misses = prefill_hits = decode_hits = 0;
         slru_promotions = slru_demotions = 0;
+        advise_willneed = advise_dontneed = advise_dropped = 0;
     }
 };
 
@@ -160,6 +180,15 @@ struct moe_cache_config {
     // null queue; a non-null queue always takes the real device path, so
     // this cannot be reached by accident in production.
     bool host_only_for_testing = false;
+    // SSD/mmap tier (P1): when non-null, the cache batches the host
+    // ranges miss-path staged copies read (WILLNEED at step end -- likely
+    // needed again next step) and the origins of evicted projections
+    // (DONTNEED at step end -- cache pressure judged them cold).  The fn
+    // must no-op for pointers outside live model mappings; llama-mmap's
+    // bridge enforces that, which is what keeps a RAM/VRAM-resident model
+    // untouched.  Production additionally gates wiring this behind
+    // GGML_MOE_CACHE_MMAP_ADVISE=1.
+    moe_cache_mmap_advise_fn mmap_advise = nullptr;
 };
 
 // Device operations, defined in moe-cache-device.cpp -- the only translation
@@ -329,6 +358,25 @@ public:
     // host->device directly.
     void inc_host_weight_copy_fallback() { m_stats.host_weight_copy_fallbacks++; }
 
+    // ---- mmap-tier advice (P1) --------------------------------------
+    // Record the host range a miss-path staged copy just read; the whole
+    // batch gets WILLNEED at step end.  No-op unless cfg.mmap_advise was
+    // set.  Hits are deliberately not recorded: their bytes are
+    // device-resident, and warming host pages nobody will read fights
+    // the page cache on exactly the machines this feature targets.
+    void advise_note_use(const void * host_src, size_t bytes);
+
+    // Fire the step's advice: DONTNEED for evicted origins (skipping any
+    // that overlap a range also used this step -- it is about to be
+    // re-read), then WILLNEED for the coalesced used ranges.  Called from
+    // the scheduler's step-end hook.  In-flight async H2D reads from an
+    // advised range are safe: the mappings are read-only and file-backed,
+    // so a dropped page refaults with identical contents.
+    void advise_flush_step();
+
+    // Drop the batches without advising (graph abandoned mid-compute).
+    void advise_abandon_step();
+
     // Set inference phase: true=prefill, false=decode.
     // During prefill, miss counts are not incremented.
     void set_phase(bool is_prefill);
@@ -404,6 +452,13 @@ private:
     std::vector<moe_cache_layer_index> m_layer_index;
     std::vector<int> m_miss_counts;
     moe_cache_stats m_stats;
+
+    // mmap-tier advice state (P1).  The batches live under m_mutex; the
+    // syscalls fire in advise_flush_step AFTER swapping them out, so the
+    // compute path never blocks on madvise.
+    moe_cache_mmap_advise_fn m_mmap_advise = nullptr;
+    std::vector<std::pair<const void *, size_t>> m_step_willneed;
+    std::vector<std::pair<const void *, size_t>> m_step_dontneed;
 
     // Pending hybrid plans, keyed by staged-tensor device base. Written
     // at staging time, taken at op time within the same split execution;

@@ -63,6 +63,7 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, void * queue) {
     m_prefill_admit   = cfg.prefill_admit;
     m_is_prefill      = false;
     m_use_slru        = (cfg.policy == "slru");
+    m_mmap_advise     = cfg.mmap_advise;
     m_deferred        = false;
 
     // Projection sizes are taken individually rather than assumed equal, so
@@ -98,6 +99,7 @@ bool moe_expert_cache::init_deferred(const moe_cache_config & cfg, void * queue)
     m_prefill_admit   = cfg.prefill_admit;
     m_is_prefill      = false;
     m_use_slru        = (cfg.policy == "slru");
+    m_mmap_advise     = cfg.mmap_advise;
     m_deferred        = true;
     m_initialized     = false;
     return true;
@@ -355,6 +357,24 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
         if (slot.occupied && slot.key.valid()) {
             m_layer_index[slot.key.layer].expert_to_slot[slot.key.expert] = -1;
             m_stats.evictions++;
+            // Cache pressure judged the old occupant cold; batch its host
+            // ranges for DONTNEED at step end (the origins are destroyed
+            // a few lines down, so capture them here).  reset() clears
+            // slots too but is administrative, not pressure, and does not
+            // advise.
+            if (m_mmap_advise) {
+                for (int p = 0; p < MOE_CACHE_N_PROJECTIONS; p++) {
+                    if ((slot.filled_mask & (1u << p)) == 0 ||
+                        slot.proj_origin[p] == nullptr || m_geom_bytes[p] == 0) {
+                        continue;
+                    }
+                    if (m_step_dontneed.size() >= MOE_CACHE_ADVISE_MAX_RANGES) {
+                        m_stats.advise_dropped++;
+                        continue;
+                    }
+                    m_step_dontneed.emplace_back(slot.proj_origin[p], m_geom_bytes[p]);
+                }
+            }
         }
         slot.key = {layer, expert};
         slot.occupied = true;
@@ -438,6 +458,70 @@ void moe_expert_cache::hybrid_purge_plans() {
     m_hybrid_plans.clear();
 }
 
+void moe_expert_cache::advise_note_use(const void * host_src, size_t bytes) {
+    if (!m_mmap_advise || !host_src || bytes == 0) return;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_step_willneed.size() >= MOE_CACHE_ADVISE_MAX_RANGES) {
+        m_stats.advise_dropped++;
+        return;
+    }
+    m_step_willneed.emplace_back(host_src, bytes);
+}
+
+void moe_expert_cache::advise_flush_step() {
+    if (!m_mmap_advise) return;
+    std::vector<std::pair<const void *, size_t>> willneed;
+    std::vector<std::pair<const void *, size_t>> dontneed;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        willneed.swap(m_step_willneed);
+        dontneed.swap(m_step_dontneed);
+    }
+    if (willneed.empty() && dontneed.empty()) return;
+
+    // Coalesce the used ranges: consecutive experts of one tensor are
+    // contiguous in the mapping, so this turns per-projection entries
+    // into a few large calls, and a disjoint sorted list makes the
+    // eviction-overlap check below a binary search.
+    std::sort(willneed.begin(), willneed.end());
+    std::vector<std::pair<uintptr_t, uintptr_t>> used;  // [first, last)
+    for (const auto & w : willneed) {
+        const uintptr_t first = (uintptr_t) w.first;
+        const uintptr_t last  = first + w.second;
+        if (!used.empty() && first <= used.back().second) {
+            used.back().second = std::max(used.back().second, last);
+        } else {
+            used.emplace_back(first, last);
+        }
+    }
+
+    for (const auto & d : dontneed) {
+        const uintptr_t first = (uintptr_t) d.first;
+        const uintptr_t last  = first + d.second;
+        // An evicted expert that also missed this step is about to be
+        // re-read; dropping its pages would fight the WILLNEED below.
+        auto it = std::upper_bound(used.begin(), used.end(),
+                                   std::make_pair(first, UINTPTR_MAX));
+        const bool overlaps =
+            (it != used.end()   && it->first < last) ||
+            (it != used.begin() && std::prev(it)->second > first);
+        if (overlaps) continue;
+        m_mmap_advise(d.first, d.second, MOE_CACHE_MMAP_ADVISE_DONTNEED);
+        m_stats.advise_dontneed++;
+    }
+    for (const auto & u : used) {
+        m_mmap_advise((const void *) u.first, u.second - u.first,
+                      MOE_CACHE_MMAP_ADVISE_WILLNEED);
+        m_stats.advise_willneed++;
+    }
+}
+
+void moe_expert_cache::advise_abandon_step() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_step_willneed.clear();
+    m_step_dontneed.clear();
+}
+
 void moe_expert_cache::note_staged_base(const void * cpy_base) {
     if (!cpy_base) return;
     std::lock_guard<std::mutex> lock(m_hybrid_mutex);
@@ -500,6 +584,11 @@ void moe_expert_cache::reset() {
     }
     std::fill(m_miss_counts.begin(), m_miss_counts.end(), 0);
     m_tick = 0;
+    // Administrative clear, not cache pressure: drop the advice batches
+    // without firing them (a /cache/reset between benchmark conditions
+    // must not yank the page cache out from under the next condition).
+    m_step_willneed.clear();
+    m_step_dontneed.clear();
     m_stats.reset();
 }
 
@@ -536,6 +625,9 @@ std::string moe_expert_cache::stats_json() const {
     ss << "\"decode_misses\":" << m_stats.decode_misses.load() << ",";
     ss << "\"slru_promotions\":" << m_stats.slru_promotions.load() << ",";
     ss << "\"slru_demotions\":" << m_stats.slru_demotions.load() << ",";
+    ss << "\"advise_willneed\":" << m_stats.advise_willneed.load() << ",";
+    ss << "\"advise_dontneed\":" << m_stats.advise_dontneed.load() << ",";
+    ss << "\"advise_dropped\":" << m_stats.advise_dropped.load() << ",";
     ss << "\"slot_count\":" << m_slots.size() << ",";
     ss << "\"slots_used\":" << used << ",";
     // Learned geometry, so a support bundle can see what the cache decided

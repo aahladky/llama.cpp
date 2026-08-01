@@ -3,9 +3,12 @@
 #include "llama-impl.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstring>
+#include <cstdint>
 #include <climits>
+#include <mutex>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -438,6 +441,102 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 // llama_mmap
 
+#ifdef _POSIX_MAPPED_FILES
+// ---- mmap advise bridge (MoE cache SSD/mmap tier) --------------------
+//
+// The MoE expert cache batches host ranges it wants advised -- WILLNEED
+// for ranges a step just read from the mapping, DONTNEED for evicted
+// ones -- and calls the bridge registered below through
+// ggml_backend_moe_set_mmap_advise_fn. The registry tracks every live
+// mapped fragment; a range not wholly inside one is ignored. That
+// containment check is the safety contract: advice can never touch
+// anonymous memory (where Linux MADV_DONTNEED is destructive), a stale
+// pointer after unload, or a neighbouring allocation.
+//
+// Windows never registers a bridge, so the cache's advice path is simply
+// absent there.
+
+static std::mutex g_mmap_advise_mutex;
+static std::vector<std::pair<uintptr_t, uintptr_t>> g_mmap_advise_ranges;  // [first, last)
+
+static void llama_mmap_advise_add_range(uintptr_t first, uintptr_t last) {
+    std::lock_guard<std::mutex> lock(g_mmap_advise_mutex);
+    g_mmap_advise_ranges.emplace_back(first, last);
+}
+
+static void llama_mmap_advise_remove_range(uintptr_t first, uintptr_t last) {
+    std::lock_guard<std::mutex> lock(g_mmap_advise_mutex);
+    std::vector<std::pair<uintptr_t, uintptr_t>> out;
+    out.reserve(g_mmap_advise_ranges.size() + 1);
+    for (const auto & r : g_mmap_advise_ranges) {
+        if (last <= r.first || r.second <= first) {
+            out.push_back(r);
+            continue;
+        }
+        if (r.first < first) out.emplace_back(r.first, first);
+        if (last < r.second) out.emplace_back(last, r.second);
+    }
+    g_mmap_advise_ranges = std::move(out);
+}
+
+static void llama_mmap_advise_bridge(const void * ptr, size_t len, int advice) {
+    if (ptr == nullptr || len == 0) {
+        return;
+    }
+    const uintptr_t page_size = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t first = (uintptr_t) ptr;
+    const uintptr_t last  = first + len;
+
+    // The syscall stays under the mutex on purpose: unmap paths remove
+    // their range from the registry (under this mutex) BEFORE munmap, so
+    // an advise that passed the containment check cannot race the pages
+    // out from under itself.
+    std::lock_guard<std::mutex> lock(g_mmap_advise_mutex);
+    bool contained = false;
+    for (const auto & r : g_mmap_advise_ranges) {
+        if (first >= r.first && last <= r.second) {
+            contained = true;
+            break;
+        }
+    }
+    if (!contained) {
+        return;
+    }
+
+    // Per-step advice failure is not actionable and would spam the log
+    // once per token, so unlike the load-time WILLNEED in the ctor below
+    // there is no warning on error.
+    if (advice == GGML_MOE_MMAP_ADVISE_WILLNEED) {
+        // Round the start DOWN to a page boundary: fragment starts are
+        // page-aligned so this stays inside the mapping, and
+        // posix_madvise requires an aligned address (the length may end
+        // mid-page).
+        const uintptr_t start = first & ~(page_size - 1);
+        posix_madvise((void *) start, last - start, POSIX_MADV_WILLNEED);
+    } else if (advice == GGML_MOE_MMAP_ADVISE_DONTNEED) {
+        // Round INWARD: a page shared with a neighbouring tensor must
+        // not be dropped on this tensor's behalf.
+        const uintptr_t start = (first + page_size - 1) & ~(page_size - 1);
+        const uintptr_t end   = last & ~(page_size - 1);
+        if (end <= start) {
+            return;
+        }
+#ifdef __linux__
+        // glibc's posix_madvise deliberately ignores POSIX_MADV_DONTNEED
+        // (the kernel's MADV_DONTNEED is destructive on anonymous
+        // memory, unlike the advisory POSIX semantics). These mappings
+        // are read-only and file-backed, where MADV_DONTNEED only drops
+        // the PTEs and the next access refaults from page cache or disk
+        // -- exactly the release wanted here -- so call madvise
+        // directly.
+        madvise((void *) start, end - start, MADV_DONTNEED);
+#else
+        posix_madvise((void *) start, end - start, POSIX_MADV_DONTNEED);
+#endif
+    }
+}
+#endif // _POSIX_MAPPED_FILES
+
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
@@ -473,6 +572,10 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
+        llama_mmap_advise_add_range((uintptr_t) addr, (uintptr_t) addr + file->size());
+        // Expose the advise bridge to the MoE cache (idempotent; the fn
+        // is stateless and consults the registry on every call).
+        ggml_backend_moe_set_mmap_advise_fn(llama_mmap_advise_bridge);
     }
 
     static void align_range(size_t * first, size_t * last, size_t page_size) {
@@ -502,6 +605,10 @@ struct llama_mmap::impl {
 
         void * next_page_start = (uint8_t *) addr + first;
 
+        // Out of the advise registry before the pages go away, so the
+        // bridge cannot advise a range mid-munmap.
+        llama_mmap_advise_remove_range((uintptr_t) addr + first, (uintptr_t) addr + last);
+
         if (munmap(next_page_start, len)) {
             LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
         }
@@ -525,6 +632,8 @@ struct llama_mmap::impl {
 
     ~impl() {
         for (const auto & frag : mapped_fragments) {
+            llama_mmap_advise_remove_range((uintptr_t) addr + frag.first,
+                                           (uintptr_t) addr + frag.second);
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
             }

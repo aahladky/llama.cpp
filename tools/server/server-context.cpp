@@ -4468,6 +4468,17 @@ void server_routes::init_routes() {
                         { "llamacpp:moe_cache_host_weight_copy_fallbacks_total",
                           "Projection copies that bypassed the cache and went host-to-device",
                           "counter", "host_weight_copy_fallbacks", false },
+                        // SSD/mmap-tier madvise management (P1); zero unless
+                        // GGML_MOE_CACHE_MMAP_ADVISE=1 wired the bridge.
+                        { "llamacpp:moe_cache_advise_willneed_total",
+                          "madvise WILLNEED calls issued for mmap-tier ranges used this step",
+                          "counter", "advise_willneed", false },
+                        { "llamacpp:moe_cache_advise_dontneed_total",
+                          "madvise DONTNEED calls issued for evicted mmap-tier ranges",
+                          "counter", "advise_dontneed", false },
+                        { "llamacpp:moe_cache_advise_dropped_total",
+                          "Advice batch entries dropped at the per-step cap",
+                          "counter", "advise_dropped", false },
                         // Hybrid GPU-hit/CPU-miss execution (Tasks G4/G5).
                         { "llamacpp:moe_hybrid_gpu_rows_total",
                           "Routed rows executed on GPU while hybrid was engaged",

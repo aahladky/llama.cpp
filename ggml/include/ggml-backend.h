@@ -403,6 +403,30 @@ extern "C" {
     typedef void (*ggml_backend_sched_moe_cache_abandon_fn)(void);
     GGML_API void ggml_backend_sched_set_moe_cache_abandon_hook(ggml_backend_sched_moe_cache_abandon_fn fn);
 
+    // Called once per completed scheduler graph compute (one decode or
+    // prefill ubatch).  The backend uses it to flush per-step batched work
+    // whose useful lifetime is exactly one step -- currently the mmap-tier
+    // madvise batch (WILLNEED for the step's miss ranges, DONTNEED for
+    // evicted ones).  Abandoned graphs do NOT fire this; their batches are
+    // dropped through the abandon hook instead.
+    typedef void (*ggml_backend_sched_moe_cache_step_end_fn)(void);
+    GGML_API void ggml_backend_sched_set_moe_cache_step_end_hook(ggml_backend_sched_moe_cache_step_end_fn fn);
+
+    // Host-memory advice bridge for the MoE cache's SSD/mmap tier.  The
+    // process's model-mapping owner (llama's mmap layer) registers a
+    // function that applies madvise to a host range IF the range lies
+    // wholly inside a live model mapping, and no-ops otherwise.  ggml
+    // never issues the syscall itself: which pointers are mmap-backed --
+    // and page alignment -- is the mapping owner's knowledge, and routing
+    // the call through the owner is what makes DONTNEED safe by
+    // construction (it can never hit anonymous memory, where the Linux
+    // semantics are destructive).  Null until a mapping registers it.
+    #define GGML_MOE_MMAP_ADVISE_WILLNEED 1
+    #define GGML_MOE_MMAP_ADVISE_DONTNEED 2
+    typedef void (*ggml_backend_moe_mmap_advise_fn)(const void * ptr, size_t len, int advice);
+    GGML_API void                            ggml_backend_moe_set_mmap_advise_fn(ggml_backend_moe_mmap_advise_fn fn);
+    GGML_API ggml_backend_moe_mmap_advise_fn ggml_backend_moe_get_mmap_advise_fn(void);
+
     //
     // Meta backend
     //

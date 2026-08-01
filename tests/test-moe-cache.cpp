@@ -739,6 +739,184 @@ static void test_concurrent_use_and_reset_survive() {
     CHECK(cache.lookup(0, 0, GATE, PROJ_BYTES) != nullptr);
 }
 
+// ---------------------------------------------------------------------
+// mmap-tier advice (P1)
+// ---------------------------------------------------------------------
+
+struct advise_call {
+    const void * ptr;
+    size_t       len;
+    int          advice;
+};
+static std::vector<advise_call> g_advise_calls;
+static void recording_advise(const void * ptr, size_t len, int advice) {
+    g_advise_calls.push_back({ptr, len, advice});
+}
+
+static moe_cache_config make_advise_config(int n_slots, int admission = 1) {
+    moe_cache_config cfg = make_config(n_slots, admission);
+    cfg.mmap_advise = recording_advise;
+    return cfg;
+}
+
+// Stable host addresses per (layer, expert): the advice ranges are the
+// promotion origins, so the source of every projection must survive and
+// be predictable across the test. Consecutive experts are contiguous
+// here exactly as consecutive experts of one tensor are in a mapping.
+static uint8_t g_advise_arena[4 * 8 * 3 * PROJ_BYTES];
+static const uint8_t * arena_base(int layer, int expert) {
+    return g_advise_arena + ((size_t)layer * 8 + expert) * 3 * PROJ_BYTES;
+}
+
+// One full use against arena addresses, including the hook's miss-path
+// advise note (the production hook calls advise_note_use for every miss
+// outcome).
+static void use_expert_advised(moe_expert_cache & cache, int layer, int expert) {
+    const uint8_t * base = arena_base(layer, expert);
+    for (int proj = GATE; proj <= DOWN; proj++) {
+        const uint8_t * src = base + (size_t)proj * PROJ_BYTES;
+        if (cache.lookup(layer, expert, proj, PROJ_BYTES, src)) {
+            continue;
+        }
+        cache.record_miss(layer, expert, proj);
+        cache.advise_note_use(src, PROJ_BYTES);
+        cache.promote_projection(layer, expert, proj, src, PROJ_BYTES);
+    }
+}
+
+static void test_advise_flush_coalesces_used_ranges() {
+    CASE("advise: flush merges contiguous used ranges into one WILLNEED");
+    g_advise_calls.clear();
+    moe_expert_cache cache;
+    CHECK(cache.init(make_advise_config(4), nullptr));
+
+    use_expert_advised(cache, 0, 0);
+    use_expert_advised(cache, 0, 1);
+    CHECK(g_advise_calls.empty());  // nothing fires before step end
+
+    cache.advise_flush_step();
+    CHECK_EQ((long long)g_advise_calls.size(), 1LL);
+    CHECK(g_advise_calls[0].ptr == arena_base(0, 0));
+    CHECK_EQ(g_advise_calls[0].len, (size_t)(2 * 3 * PROJ_BYTES));
+    CHECK_EQ(g_advise_calls[0].advice, MOE_CACHE_MMAP_ADVISE_WILLNEED);
+    CHECK_EQ((long long)cache.stats().advise_willneed.load(), 1LL);
+
+    // The batch was consumed: a second flush is silent.
+    g_advise_calls.clear();
+    cache.advise_flush_step();
+    CHECK(g_advise_calls.empty());
+}
+
+static void test_advise_eviction_fires_dontneed_before_willneed() {
+    CASE("advise: eviction DONTNEEDs the evicted origins, before WILLNEED");
+    g_advise_calls.clear();
+    moe_expert_cache cache;
+    CHECK(cache.init(make_advise_config(2), nullptr));
+
+    use_expert_advised(cache, 0, 0);
+    use_expert_advised(cache, 0, 1);
+    cache.advise_flush_step();
+    g_advise_calls.clear();
+
+    // Expert 0 is the LRU victim.
+    use_expert_advised(cache, 0, 2);
+    cache.advise_flush_step();
+
+    CHECK_EQ((long long)g_advise_calls.size(), 4LL);
+    for (int p = 0; p < 3; p++) {
+        CHECK_EQ(g_advise_calls[p].advice, MOE_CACHE_MMAP_ADVISE_DONTNEED);
+        CHECK(g_advise_calls[p].ptr == arena_base(0, 0) + (size_t)p * PROJ_BYTES);
+        CHECK_EQ(g_advise_calls[p].len, PROJ_BYTES);
+    }
+    CHECK_EQ(g_advise_calls[3].advice, MOE_CACHE_MMAP_ADVISE_WILLNEED);
+    CHECK(g_advise_calls[3].ptr == arena_base(0, 2));
+    CHECK_EQ((long long)cache.stats().advise_dontneed.load(), 3LL);
+}
+
+static void test_advise_dontneed_suppressed_when_used_same_step() {
+    CASE("advise: an evicted range also used this step is not DONTNEEDed");
+    g_advise_calls.clear();
+    moe_expert_cache cache;
+    CHECK(cache.init(make_advise_config(1), nullptr));
+
+    use_expert_advised(cache, 0, 0);
+    cache.advise_flush_step();
+    g_advise_calls.clear();
+
+    // One step: expert 1 evicts expert 0, then expert 0 misses again and
+    // evicts expert 1. Both evicted ranges were also used this step, so
+    // dropping their pages would fight the WILLNEED for the same bytes.
+    use_expert_advised(cache, 0, 1);
+    use_expert_advised(cache, 0, 0);
+    cache.advise_flush_step();
+
+    for (const auto & c : g_advise_calls) {
+        CHECK(c.advice != MOE_CACHE_MMAP_ADVISE_DONTNEED);
+    }
+    CHECK_EQ((long long)cache.stats().advise_dontneed.load(), 0LL);
+    CHECK_EQ((long long)g_advise_calls.size(), 1LL);  // contiguous, coalesced
+}
+
+static void test_advise_reset_is_administrative() {
+    CASE("advise: reset drops pending batches without advising");
+    g_advise_calls.clear();
+    moe_expert_cache cache;
+    CHECK(cache.init(make_advise_config(4), nullptr));
+
+    use_expert_advised(cache, 0, 0);
+    cache.reset();
+    CHECK(g_advise_calls.empty());
+    cache.advise_flush_step();
+    CHECK(g_advise_calls.empty());
+}
+
+static void test_advise_abandon_drops_batches() {
+    CASE("advise: an abandoned step advises nothing");
+    g_advise_calls.clear();
+    moe_expert_cache cache;
+    CHECK(cache.init(make_advise_config(4), nullptr));
+
+    use_expert_advised(cache, 0, 0);
+    cache.advise_abandon_step();
+    cache.advise_flush_step();
+    CHECK(g_advise_calls.empty());
+}
+
+static void test_advise_disabled_by_default() {
+    CASE("advise: a cache without the fn never batches or fires");
+    g_advise_calls.clear();
+    moe_expert_cache cache;
+    CHECK(cache.init(make_config(1), nullptr));  // no mmap_advise
+
+    use_expert_advised(cache, 0, 0);
+    use_expert_advised(cache, 0, 1);  // eviction happens with advice off
+    cache.advise_flush_step();
+    CHECK(g_advise_calls.empty());
+    CHECK_EQ((long long)cache.stats().advise_willneed.load(), 0LL);
+    CHECK_EQ((long long)cache.stats().advise_dontneed.load(), 0LL);
+}
+
+static void test_advise_cap_drops_and_counts() {
+    CASE("advise: the per-step cap drops loudly, never silently");
+    g_advise_calls.clear();
+    moe_expert_cache cache;
+    CHECK(cache.init(make_advise_config(4), nullptr));
+
+    for (int i = 0; i < MOE_CACHE_ADVISE_MAX_RANGES + 4; i++) {
+        cache.advise_note_use(arena_base(0, 0), PROJ_BYTES);
+    }
+    CHECK_EQ((long long)cache.stats().advise_dropped.load(), 4LL);
+    cache.advise_flush_step();
+    // Identical ranges coalesce to one call; the drop is visible in the
+    // counter, not in lost advice for distinct ranges.
+    CHECK_EQ((long long)g_advise_calls.size(), 1LL);
+
+    const std::string json = cache.stats_json();
+    CHECK(json.find("advise_willneed") != std::string::npos);
+    CHECK(json.find("advise_dontneed") != std::string::npos);
+    CHECK(json.find("advise_dropped") != std::string::npos);
+}
+
 int main() {
     test_admission_threshold_one();
     test_admission_threshold_two_needs_a_second_use();
@@ -778,6 +956,14 @@ int main() {
     test_staged_bases_survive_reset();
     test_admission_blocked_by_phase_tracks_prefill_policy();
     test_concurrent_use_and_reset_survive();
+
+    test_advise_flush_coalesces_used_ranges();
+    test_advise_eviction_fires_dontneed_before_willneed();
+    test_advise_dontneed_suppressed_when_used_same_step();
+    test_advise_reset_is_administrative();
+    test_advise_abandon_drops_batches();
+    test_advise_disabled_by_default();
+    test_advise_cap_drops_and_counts();
 
     if (g_failures) {
         fprintf(stderr, "\n%d check(s) failed\n", g_failures);

@@ -369,3 +369,20 @@ target_include_directories(test-moe-hybrid PRIVATE ${PROJECT_SOURCE_DIR}/ggml/sr
 target_link_libraries(test-moe-hybrid PRIVATE ggml-base Threads::Threads)
 add_test(NAME test-moe-hybrid COMMAND test-moe-hybrid)
 set_property(TEST test-moe-hybrid PROPERTY LABELS main)
+
+# mmap advise bridge tests (P1: SSD/mmap-tier madvise management). Runs
+# the real llama_mmap against a temp file and asserts through /proc that
+# DONTNEED drops mapped pages, that rounding is inward, and -- the safety
+# contract -- that pointers outside a live mapping are never advised.
+# Compiled directly like the cache tests: it needs llama-mmap and the
+# logging TU it depends on, not all of llama.
+add_executable(test-mmap-advise
+    test-mmap-advise.cpp
+    ${PROJECT_SOURCE_DIR}/src/llama-mmap.cpp
+    ${PROJECT_SOURCE_DIR}/src/llama-impl.cpp)
+target_include_directories(test-mmap-advise PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(test-mmap-advise PRIVATE ggml-base Threads::Threads)
+add_test(NAME test-mmap-advise COMMAND test-mmap-advise)
+set_property(TEST test-mmap-advise PROPERTY LABELS main)

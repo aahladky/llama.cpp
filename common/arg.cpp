@@ -2672,6 +2672,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             const bool moe_cache_prefill_policy  = cache_implemented;  // prefill/decode phase admission policy
             const bool moe_cache_reset           = cache_implemented;  // cache reset via API
             const bool moe_cache_prefetch        = false;     // NOT IMPLEMENTED: expert prefetch (Phase 9)
+            // SSD/mmap-tier madvise management (P1): WILLNEED for a step's
+            // miss ranges, DONTNEED for evicted ones, opt-in at runtime via
+            // GGML_MOE_CACHE_MMAP_ADVISE=1. POSIX mappings only; rides on
+            // the cache hook, so exactly as available as the cache itself
+            // on this platform.
+#ifdef _WIN32
+            const bool moe_cache_mmap_advise     = false;
+#else
+            const bool moe_cache_mmap_advise     = cache_implemented;
+#endif
             // Routed MoE ops honour their own offload minimum
             // (GGML_OP_OFFLOAD_MOE_MIN_BATCH). Derived from the same
             // backend probe as the cache rather than hardcoded: the field
@@ -2734,6 +2744,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             printf("    \"moe_cache_prefill_policy\": %s,\n", moe_cache_prefill_policy ? "true" : "false");
             printf("    \"moe_cache_reset\": %s,\n", moe_cache_reset ? "true" : "false");
             printf("    \"moe_cache_prefetch\": %s,\n", moe_cache_prefetch ? "true" : "false");
+            printf("    \"moe_cache_mmap_advise\": %s,\n", moe_cache_mmap_advise ? "true" : "false");
             printf("    \"moe_offload_threshold_control\": %s,\n", moe_offload_threshold_control ? "true" : "false");
             // Schema 3: --moe-cache-bytes accepts a per-device map
             // (SYCL0=N,SYCL1=N) as well as a single uniform value. Tied

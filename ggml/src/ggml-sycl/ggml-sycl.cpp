@@ -4792,6 +4792,25 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     cfg.policy = (const char *)g_moe_cache_policy;
     cfg.admission_misses = (int)g_moe_cache_admission;
     cfg.prefill_admit = g_moe_cache_prefill_admit;
+    // SSD/mmap-tier advice is opt-in: on a box where the model is
+    // RAM-comfortable, DONTNEED would drop resident pages for no benefit.
+    // The bridge is registered by llama-mmap at model load, which happens
+    // before the first staged copy reaches this lazy init; a --no-mmap
+    // load never registers one and the getter stays null.
+    static const bool mmap_advise_on = [] {
+        const char * env = getenv("GGML_MOE_CACHE_MMAP_ADVISE");
+        return env && atoi(env) > 0;
+    }();
+    if (mmap_advise_on) {
+        static_assert(MOE_CACHE_MMAP_ADVISE_WILLNEED == GGML_MOE_MMAP_ADVISE_WILLNEED &&
+                      MOE_CACHE_MMAP_ADVISE_DONTNEED == GGML_MOE_MMAP_ADVISE_DONTNEED,
+                      "advice constants must match ggml-backend.h");
+        cfg.mmap_advise = ggml_backend_moe_get_mmap_advise_fn();
+        if (!cfg.mmap_advise) {
+            fprintf(stderr, "moe_cache: GGML_MOE_CACHE_MMAP_ADVISE=1 but no model "
+                            "mapping registered an advise bridge -- advice disabled\n");
+        }
+    }
 
     auto cache = std::make_shared<moe_expert_cache>();
     if (cache->init_deferred(cfg, ctx.stream())) {
@@ -4927,6 +4946,11 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
 
     // Cache miss: promote to cache slot, then copy from cache slot to dst.
     ctx->moe_cache->record_miss(layer, expert_id, proj);
+    // Every miss outcome below reads this projection's host bytes (the
+    // promote copy, the hybrid CPU tier, or the scheduler's fallback
+    // copy); batch the range for a WILLNEED at step end -- likely needed
+    // again next step. No-op unless mmap advice is wired.
+    ctx->moe_cache->advise_note_use(host_src, expert_bytes);
     void * slot = ctx->moe_cache->promote_projection(layer, expert_id, proj,
                                                       host_src, expert_bytes);
     if (slot) {
@@ -4988,6 +5012,26 @@ static void moe_cache_abandon_pending(void) {
         }
         if (cache) {
             cache->hybrid_purge_plans();
+            // The abandoned graph's advice batch is stale too: its
+            // step-end will never fire, and next graph's batch must not
+            // inherit ranges from a step that never completed.
+            cache->advise_abandon_step();
+        }
+    }
+}
+
+// Scheduler step-end hook: one completed graph compute (one ubatch).
+// Flush each device cache's batched mmap advice; no-op per cache unless
+// advice was wired at init.
+static void moe_cache_step_end(void) {
+    for (int dev = 0; dev < GGML_SYCL_MAX_DEVICES; dev++) {
+        std::shared_ptr<moe_expert_cache> cache;
+        {
+            std::lock_guard<std::mutex> lock(g_moe_cache_registry_mutex);
+            cache = g_moe_cache_registry[dev].lock();
+        }
+        if (cache) {
+            cache->advise_flush_step();
         }
     }
 }
@@ -7261,6 +7305,7 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
     if (any_budget) {
         ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
         ggml_backend_sched_set_moe_cache_abandon_hook(moe_cache_abandon_pending);
+        ggml_backend_sched_set_moe_cache_step_end_hook(moe_cache_step_end);
     }
 #endif
 
