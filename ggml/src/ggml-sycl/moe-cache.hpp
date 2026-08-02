@@ -392,6 +392,22 @@ public:
 
     const moe_cache_stats & stats() const { return m_stats; }
     int slot_count() const { return (int)m_slots.size(); }
+
+    // What the learning window decided.  Read-only observers for the
+    // execution fingerprint: the learned per-projection size is what
+    // decides, for the rest of the process, which projections can be
+    // cached at all, so a fingerprint that omits it cannot tell a
+    // different geometry from a different access pattern.  Unlocked
+    // deliberately -- these are written once under m_mutex during
+    // finalization and never again, and the fingerprint must not be able
+    // to serialize the compute path against the HTTP threads.
+    size_t geometry_bytes(int projection) const {
+        return (projection >= 0 && projection < MOE_CACHE_N_PROJECTIONS)
+             ? m_geom_bytes[projection] : 0;
+    }
+    size_t slot_bytes() const { return m_expert_bytes; }
+    const void * pool_base() const { return m_pool; }
+
     int slots_used() const;
     size_t budget_bytes() const { return m_budget_bytes; }
     bool is_initialized() const { return m_initialized; }

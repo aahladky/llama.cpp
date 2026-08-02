@@ -76,6 +76,7 @@
 #include <mutex>
 #include <thread>
 #include "moe-hybrid.hpp"
+#include "moe-fingerprint.hpp"
 // Cache configuration is obtained through backend registry procedures
 // (ggml_backend_moe_cache_configure_v1 via reg_get_proc_address below)
 // so static and dynamically loaded (GGML_BACKEND_DL) SYCL backends use
@@ -146,6 +147,11 @@ int g_ggml_sycl_debug = 0;
 int g_ggml_sycl_enable_optimize = 1;
 int g_ggml_sycl_enable_graph = 0;
 int g_ggml_sycl_enable_dnn = 1;
+// Pin oneDNN matmul reduction order.  On by default: an inference server
+// that cannot reproduce its own greedy output cannot be A/B'd, and the
+// cost is measured rather than assumed (see the determinism evidence).
+int g_ggml_sycl_deterministic = 1;
+int ggml_sycl_deterministic() { return g_ggml_sycl_deterministic; }
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_vmm = 1;
@@ -349,6 +355,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_optimize = ggml_sycl_get_env("GGML_SYCL_ENABLE_OPT", 1);
         g_ggml_sycl_enable_graph = ggml_sycl_get_env("GGML_SYCL_ENABLE_GRAPH", 0);
         g_ggml_sycl_enable_dnn = ggml_sycl_get_env("GGML_SYCL_ENABLE_DNN", 1);
+        g_ggml_sycl_deterministic = ggml_sycl_get_env("GGML_SYCL_DETERMINISTIC", 1);
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
@@ -418,6 +425,7 @@ static void ggml_check_sycl() try {
 
 #if defined(GGML_SYCL_DNNL)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: %d\n", g_ggml_sycl_enable_dnn);
+        GGML_LOG_INFO("  GGML_SYCL_DETERMINISTIC: %d\n", g_ggml_sycl_deterministic);
         GGML_LOG_INFO("  GGML_SYCL_FA_ONEDNN: %d\n", g_ggml_sycl_fa_onednn);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_DNN: DNN disabled by compile flag\n");
@@ -4896,7 +4904,13 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
 
     int layer = moe_cache_parse_layer(tensor_name);
     int proj  = moe_cache_parse_projection(tensor_name);
-    if (layer < 0 || proj < 0) return false;
+    if (layer < 0 || proj < 0) {
+        if (moe_fp_enabled()) {
+            moe_fp_stage(ctx->device, layer, proj, expert_id,
+                         MOE_FP_DISP_NOT_ROUTED, nullptr, host_src);
+        }
+        return false;
+    }
 
     // Whatever happens below -- hit, promote, hybrid skip, learning pass,
     // or fall-through to the scheduler's plain copy -- this device base is
@@ -4912,6 +4926,24 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     if (ctx->moe_cache->is_learning()) {
         const void * origin = host_src - (size_t)expert_id * expert_bytes;
         ctx->moe_cache->observe_geometry(layer, proj, expert_bytes, origin);
+        if (moe_fp_enabled()) {
+            moe_fp_stage(ctx->device, layer, proj, expert_id,
+                         MOE_FP_DISP_LEARNING,
+                         dst - (size_t) expert_id * expert_bytes, host_src);
+            // The learning window closing is the single most consequential
+            // event in the run: it fixes, for the process lifetime, which
+            // projections are cacheable at all. Record the exact staging
+            // decision it landed on.
+            if (!ctx->moe_cache->is_learning()) {
+                moe_fp_geom(ctx->device,
+                            ctx->moe_cache->geometry_bytes(0),
+                            ctx->moe_cache->geometry_bytes(1),
+                            ctx->moe_cache->geometry_bytes(2),
+                            ctx->moe_cache->slot_count(),
+                            ctx->moe_cache->slot_bytes(),
+                            ctx->moe_cache->pool_base());
+            }
+        }
         return false;
     }
 
@@ -4934,6 +4966,10 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     void * cached = ctx->moe_cache->lookup(layer, expert_id, proj, expert_bytes,
                                            host_src);
     if (cached) {
+        if (moe_fp_enabled()) {
+            moe_fp_stage(ctx->device, layer, proj, expert_id, MOE_FP_DISP_HIT,
+                         dst - (size_t) expert_id * expert_bytes, host_src);
+        }
         // Cache hit: copy from cache slot to dst (GPU-to-GPU).
         // dst is input_cpy->data + eid * expert_size.
         // The compute kernel will read from input_cpy as usual.
@@ -4958,6 +4994,10 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     void * slot = ctx->moe_cache->promote_projection(layer, expert_id, proj,
                                                       host_src, expert_bytes);
     if (slot) {
+        if (moe_fp_enabled()) {
+            moe_fp_stage(ctx->device, layer, proj, expert_id, MOE_FP_DISP_PROMOTE,
+                         dst - (size_t) expert_id * expert_bytes, host_src);
+        }
         SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(dst, slot, expert_bytes)));
         if (padding > 0) {
             SYCL_CHECK(CHECK_TRY_ERROR(
@@ -4981,6 +5021,10 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     if (g_moe_hybrid_mode && moe_cpu_can_execute(wtype)
             && !ctx->moe_cache->admission_blocked_by_phase()) {
         const void * cpy_base = dst - (size_t) expert_id * expert_bytes;
+        if (moe_fp_enabled()) {
+            moe_fp_stage(ctx->device, layer, proj, expert_id,
+                         MOE_FP_DISP_HYBRID_SKIP, cpy_base, host_src);
+        }
         ctx->moe_cache->hybrid_record_skip(cpy_base, expert_id, host_src, wtype);
         // MMQ kernels read up to 512 bytes past the previous expert's
         // region, i.e. into the FIRST bytes of this one. The previous
@@ -4996,6 +5040,10 @@ static bool moe_cache_hook_copy(ggml_backend_t backend, const char * tensor_name
     }
 
     // Fall through to normal host-to-device copy.
+    if (moe_fp_enabled()) {
+        moe_fp_stage(ctx->device, layer, proj, expert_id, MOE_FP_DISP_FALLBACK,
+                     dst - (size_t) expert_id * expert_bytes, host_src);
+    }
     ctx->moe_cache->inc_host_weight_copy_fallback();
     return false;
 }
@@ -5036,8 +5084,18 @@ static void moe_cache_step_end(void) {
         }
         if (cache) {
             cache->advise_flush_step();
+            if (moe_fp_enabled()) {
+                const moe_cache_stats & st = cache->stats();
+                moe_fp_step_end(dev, st.hits, st.misses, st.evictions,
+                                st.promotions, st.host_weight_copy_fallbacks,
+                                st.cache_served_projections,
+                                (uint64_t) g_hybrid_counters[dev].staging_skips,
+                                cache->slots_used());
+            }
         }
     }
+    // One graph is one step whether zero, one or two devices have caches.
+    if (moe_fp_enabled()) moe_fp_step_advance();
 }
 
 // Collect cache stats from all initialized caches.
@@ -5188,6 +5246,85 @@ static void ggml_backend_sycl_moe_hybrid_set_mode_v1(int mode) {
 }
 #endif
 
+// Optional per-op tensor hashes (GGML_MOE_FINGERPRINT_DST=1).  Forces a
+// device sync and a full D2H copy, so this is only for localizing the first
+// op whose numbers differ between two runs -- never for a battery.
+//
+// The OUTPUT alone cannot say whether an op is the source of a divergence or
+// merely the first place it was looked for, so the INPUTS are hashed too:
+// the staged expert weights (src0) and the activations (src1).  src1 differing
+// means the divergence arrived from upstream; src0 differing means staging
+// delivered different bytes; both matching while dst differs means the kernel
+// itself is not a function of its inputs.
+//
+// GGML_MOE_FINGERPRINT_DST_LAYER restricts this to one layer -- src0 for a
+// routed expert tensor is hundreds of megabytes, and copying that back for
+// all 48 layers turns a decode step into minutes.
+static int moe_fp_dst_layer_filter() {
+    static const int n = [] {
+        const char * v = getenv("GGML_MOE_FINGERPRINT_DST_LAYER");
+        return (v && *v) ? atoi(v) : -1;
+    }();
+    return n;
+}
+
+static uint64_t moe_fp_hash_tensor(ggml_backend_sycl_context & ctx,
+                                   const ggml_tensor * t) {
+    const size_t n = ggml_nbytes(t);
+    std::vector<char> host(n);
+    const queue_ptr q = ctx.stream();
+    SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(host.data(), t->data, n)));
+    SYCL_CHECK(CHECK_TRY_ERROR(q->wait()));
+    return moe_fp_hash(host.data(), n);
+}
+
+static void moe_fp_hash_dst(ggml_backend_sycl_context & ctx,
+                            const ggml_tensor * dst, int layer, int proj,
+                            const std::vector<char> & ids_host,
+                            const ggml_tensor * ids) {
+    if (!moe_fp_dst_enabled()) return;
+    const int only = moe_fp_dst_layer_filter();
+    if (only >= 0 && layer != only) return;
+    moe_fp_dst(ctx.device, layer, proj, moe_fp_hash_tensor(ctx, dst));
+    if (only < 0) return;
+
+    // Inputs, on the same record stream, tagged by negative projection so the
+    // reader can tell them apart without a second record type.
+    //
+    // src0 is hashed over the USED experts only.  The staged copy buffer is
+    // sized for all n_expert slots but the scheduler writes only the ones this
+    // step routed to, so the rest hold whatever the previous step left there.
+    // Hashing the whole tensor therefore always differs and says nothing;
+    // hashing the regions the kernels actually read is the question.
+    const ggml_tensor * src0 = dst->src[0];
+    const int64_t n_expert = src0->ne[2];
+    std::vector<bool> used((size_t) n_expert, false);
+    for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
+            const int32_t e = *(const int32_t *)(ids_host.data() + i1*ids->nb[1] + i0*ids->nb[0]);
+            if (e >= 0 && e < n_expert) used[(size_t) e] = true;
+        }
+    }
+    const size_t expert_bytes = src0->nb[2];
+    std::vector<char> host(expert_bytes);
+    const queue_ptr q = ctx.stream();
+    uint64_t h = 1469598103934665603ull;
+    int n_used = 0;
+    for (int64_t e = 0; e < n_expert; e++) {
+        if (!used[(size_t) e]) continue;
+        n_used++;
+        SYCL_CHECK(CHECK_TRY_ERROR(q->memcpy(
+            host.data(), (const char *) src0->data + (size_t) e * expert_bytes,
+            expert_bytes)));
+        SYCL_CHECK(CHECK_TRY_ERROR(q->wait()));
+        h ^= moe_fp_hash(host.data(), expert_bytes);
+        h *= 1099511628211ull;
+    }
+    moe_fp_dst(ctx.device, layer, -1 - proj, h);
+    moe_fp_dst(ctx.device, layer, -10 - proj, moe_fp_hash_tensor(ctx, dst->src[1]));
+    moe_fp_dst(ctx.device, layer, -20 - proj, (uint64_t) n_used);
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -5215,9 +5352,29 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         hplan = ctx.moe_cache->hybrid_take_plan(src0->data);
     }
 
+    // Fingerprint identity for this op.  The tensor NAME is what makes an op
+    // recognizable across runs (addresses and node indices are not).  src0 is
+    // the scheduler's staged copy, named "<backend>#<original>#<n>", so the
+    // layer parser -- which anchors on a leading "blk." -- has to be pointed
+    // at the embedded original name rather than the whole thing.
+    int fp_layer = -1, fp_proj = -1;
+    if (moe_fp_enabled()) {
+        const char * blk = strstr(src0->name, "blk.");
+        fp_layer = moe_cache_parse_layer(blk ? blk : src0->name);
+        fp_proj  = moe_cache_parse_projection(src0->name);
+    }
+
     if (ne12 == 1) {
         if (hplan.empty() &&
             ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+            if (moe_fp_enabled()) {
+                // The fused path never reads ids on the host, so there is no
+                // routing tensor to hash here without adding a copy.  0 marks
+                // "not observed" rather than "empty".
+                moe_fp_op(ctx.device, fp_layer, fp_proj, ne00, ne01, ne11, ne12,
+                          "mmvq_fused", 0, 0, (int)(ids->ne[1] * n_ids), 0,
+                          src0->data, 0);
+            }
             return;
         }
     }
@@ -5230,6 +5387,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
     // also ensures ctx.mmid_row_mapping_host is drained before we use it again
     SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+
+    // Routing is now on the host and already paid for: hash it here rather
+    // than re-reading the tensor.  This is what makes a run with no cache
+    // comparable to one with a cache -- see moe_fp_op.
+    const uint64_t fp_ids_hash = moe_fp_enabled()
+        ? moe_fp_hash(ids_host.data(), ids_host.size()) : 0;
 
     ggml_tensor src0_row = *src0;
     ggml_tensor src1_row = *src1;
@@ -5383,6 +5546,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 std::chrono::duration<double, std::milli>(t_cpu1 - t_cpu0).count());
             moe_hybrid_time_add(hc.merge_time_ms,
                 std::chrono::duration<double, std::milli>(t_mrg - t_cpu1).count());
+        }
+
+        if (moe_fp_enabled()) {
+            moe_fp_op(ctx.device, fp_layer, fp_proj, ne00, ne01, ne11, ne12,
+                      "rowwise", (int) hplan.skips.size(), (int) cpu_rows.size(),
+                      (int) gpu_rows.size(), 0, src0->data, fp_ids_hash);
+            moe_fp_hash_dst(ctx, dst, fp_layer, fp_proj, ids_host, ids);
         }
     } else {
         const int64_t n_routed_rows = ids->ne[1] * n_ids;
@@ -5562,6 +5732,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                                    ne0, nb1, nb2, item_ct1);
                     });
             });
+        }
+
+        if (moe_fp_enabled()) {
+            int64_t fp_cpu_rows = 0;
+            for (const auto & ce : cpu_experts) fp_cpu_rows += ce.n_rows;
+            moe_fp_op(ctx.device, fp_layer, fp_proj, ne00, ne01, ne11, ne12,
+                      "batched", (int) hplan.skips.size(), (int) fp_cpu_rows,
+                      (int) (n_routed_rows - fp_cpu_rows), 0, src0->data,
+                      fp_ids_hash);
+            moe_fp_hash_dst(ctx, dst, fp_layer, fp_proj, ids_host, ids);
         }
     }
 }
@@ -7344,6 +7524,12 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
     if (any_budget) {
         ggml_backend_sched_set_moe_cache_hook(moe_cache_hook_copy);
         ggml_backend_sched_set_moe_cache_abandon_hook(moe_cache_abandon_pending);
+        ggml_backend_sched_set_moe_cache_step_end_hook(moe_cache_step_end);
+    } else if (moe_fp_enabled()) {
+        // No cache, but the fingerprint is on: the step-end hook is what
+        // numbers the graphs, and a fingerprint whose records all claim step
+        // 0 cannot be lined up against a run that has a cache. The hook
+        // finds no cache to flush and does nothing but advance the counter.
         ggml_backend_sched_set_moe_cache_step_end_hook(moe_cache_step_end);
     }
 #endif

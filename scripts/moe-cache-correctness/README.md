@@ -34,6 +34,25 @@ Compare the printed `tokens:` arrays against a stock-upstream oracle build
 model's actual generated text is gibberish (untrained random weights) and
 is not itself meaningful.
 
+## run_reproducibility.py — ask this first
+
+Every comparison above assumes each condition reproduces *itself*. For a
+month one did not, on the 122B, and the A/Bs built on top were comparing
+two samples from a distribution rather than two configurations. The cause
+was outside the cache entirely (oneDNN matmul reduction order; see
+`modelctl/docs/runtime/moe-cache-testing.md` §3), but the lesson is about
+method: run the reference against itself before comparing anything to it.
+
+```bash
+python3 run_reproducibility.py --bin-dir <bin> --model <gguf> --runs 3 \
+    -- -ngl 99 -ot "exps=CPU" --moe-cache-bytes 4194304
+```
+
+It launches a fresh server per run and compares **logprobs**, not only
+token ids: greedy argmax absorbs large logit perturbations, so identical
+token arrays are weak evidence. Exit status is nonzero if any run
+disagrees with the first.
+
 ## Known quirks worth knowing before re-running this
 
 - A `moe_cache_hits_total`/`misses_total` metric staying flat across

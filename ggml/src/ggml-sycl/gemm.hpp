@@ -20,6 +20,11 @@
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
 
+// Defined in ggml-sycl.cpp (GGML_SYCL_DETERMINISTIC).  Declared here
+// rather than pulled in from common.hpp so this header keeps its very
+// small include surface.
+int ggml_sycl_deterministic();
+
 class DnnlGemmWrapper {
 public:
     using dt = dnnl::memory::data_type;
@@ -56,6 +61,20 @@ public:
         const auto c_md    = dnnl::memory::desc(c_dims, ct, c_strides);
         dnnl::primitive_attr primitive_attr;
         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+
+        // oneDNN's default permits a GPU matmul to reduce in whatever order
+        // its chosen implementation likes -- split-K partials can land in a
+        // different order from one execution to the next, so the same inputs
+        // do not have to give the same float back.  For a matmul inside a
+        // greedy-decoding language model that is not a rounding curiosity: it
+        // moves logits enough to flip an argmax, and once one token differs
+        // the rest of the sequence is a different sequence.  The deterministic
+        // attribute pins the reduction order; it can cost throughput, so it is
+        // a runtime choice (GGML_SYCL_DETERMINISTIC), defaulting to on because
+        // a reproducible answer is the one people can debug and compare.
+        if (ggml_sycl_deterministic()) {
+            primitive_attr.set_deterministic(true);
+        }
 
 #ifdef GGML_SYCL_F16
         primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
