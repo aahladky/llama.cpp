@@ -4801,12 +4801,17 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     cfg.admission_misses = (int)g_moe_cache_admission;
     cfg.prefill_admit = g_moe_cache_prefill_admit;
     // Async admission fills: reserve at miss time, copy on a dedicated
-    // transfer queue at step end (ordered after compute by a barrier).
-    // Default ON; GGML_MOE_CACHE_ASYNC_FILL=0 restores the synchronous
-    // promote-copy path for A/B comparison.
+    // transfer queue at step end. Default OFF: the 2026-08-02 paired A/B
+    // (35B, C2 and C3, quiet machine, 3 pairs each) measured async at
+    // -31% decode vs the synchronous promote path, load-insensitive --
+    // the v1 mechanism (a barrier per fill on the compute queue,
+    // pageable-source copies on the second queue) costs more than the
+    // fill serialization it removes, and the in-order queue was already
+    // absorbing sync fills. GGML_MOE_CACHE_ASYNC_FILL=1 re-enables the
+    // path for future work (pinned staging ring, batched barrier).
     static const bool async_fill_on = [] {
         const char * env = getenv("GGML_MOE_CACHE_ASYNC_FILL");
-        return env == nullptr || atoi(env) > 0;
+        return env != nullptr && atoi(env) > 0;
     }();
     cfg.async_fill = async_fill_on;
     // SSD/mmap-tier advice is opt-in: on a box where the model is
