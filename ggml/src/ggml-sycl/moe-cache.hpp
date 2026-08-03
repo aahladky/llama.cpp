@@ -92,6 +92,9 @@ struct moe_cache_slot {
     bool occupied       = false;
     bool protected_seg  = false;  // SLRU protected segment
     uint8_t filled_mask = 0;      // bit0=gate, bit1=up, bit2=down
+    // Async-fill reservations: projections whose copy is queued but not
+    // yet complete. Invisible to lookup(), immune to eviction.
+    uint8_t pending_mask = 0;
     uint64_t last_access = 0;
     uint64_t access_count = 0;
     void * device_ptr   = nullptr;  // SYCL USM allocation
@@ -151,6 +154,14 @@ struct moe_cache_stats {
     std::atomic<uint64_t> advise_willneed{0};
     std::atomic<uint64_t> advise_dontneed{0};
     std::atomic<uint64_t> advise_dropped{0};
+    // Plans that survived a completed graph and were purged at step end
+    // (each one is a leak of the class the C3 hang grew from).
+    std::atomic<uint64_t> hybrid_stale_plans_purged{0};
+    // Async admission fills (reserve at miss, copy at step end).
+    std::atomic<uint64_t> async_fills_enqueued{0};
+    std::atomic<uint64_t> async_fills_completed{0};
+    std::atomic<uint64_t> async_fills_discarded{0};
+    std::atomic<uint64_t> async_fill_bytes{0};
 
     void reset() {
         hits = misses = evictions = promotions = 0;
@@ -158,6 +169,9 @@ struct moe_cache_stats {
         prefill_misses = decode_misses = prefill_hits = decode_hits = 0;
         slru_promotions = slru_demotions = 0;
         advise_willneed = advise_dontneed = advise_dropped = 0;
+        hybrid_stale_plans_purged = 0;
+        async_fills_enqueued = async_fills_completed = 0;
+        async_fills_discarded = async_fill_bytes = 0;
     }
 };
 
@@ -189,6 +203,13 @@ struct moe_cache_config {
     // untouched.  Production additionally gates wiring this behind
     // GGML_MOE_CACHE_MMAP_ADVISE=1.
     moe_cache_mmap_advise_fn mmap_advise = nullptr;
+    // Async admission fills: promote_projection only RESERVES a slot; the
+    // H2D copy runs on a dedicated transfer queue at step end, ordered
+    // after the graph's compute by a barrier event, and the projection
+    // stays invisible until the copy completes. Removes every fill from
+    // the compute stream. Default off here; the backend turns it on
+    // unless GGML_MOE_CACHE_ASYNC_FILL=0.
+    bool async_fill = false;
 };
 
 // Device operations, defined in moe-cache-device.cpp -- the only translation
@@ -202,6 +223,21 @@ struct moe_cache_config {
 void * moe_cache_device_alloc(size_t bytes, void * queue);
 void   moe_cache_device_free(void * ptr, void * queue);
 bool   moe_cache_device_copy(void * dst, const void * src, size_t bytes, void * queue);
+
+// Async-fill support (moe-cache-device.cpp). The transfer queue is a
+// second in-order queue on the compute queue's device+context. A fill
+// submitted through moe_cache_device_copy_async_after runs on the
+// transfer queue but only after everything already submitted on the
+// compute queue (barrier dependency) -- so a refill of a reused slot can
+// never overwrite bytes an in-flight kernel or D2D hit copy still reads.
+// Returns an opaque event (freed with moe_cache_device_event_free), or
+// null on submission failure.
+void * moe_cache_device_create_transfer_queue(void * compute_queue);
+void   moe_cache_device_destroy_transfer_queue(void * transfer_queue);
+void * moe_cache_device_copy_async_after(void * dst, const void * src, size_t bytes,
+                                         void * transfer_queue, void * compute_queue);
+bool   moe_cache_device_event_complete(void * ev);
+void   moe_cache_device_event_free(void * ev);
 
 // The cache itself.
 class moe_expert_cache {
@@ -303,6 +339,22 @@ public:
     // their plans, and a later tensor reusing a staged base must not
     // inherit one and compute with the wrong host weights.
     void hybrid_purge_plans();
+
+    // Purge plans that survived a COMPLETED graph. Any plan not taken by
+    // its op by the time the graph finishes is leaked -- and because
+    // hybrid_record_skip merges into an existing plan at the same staged
+    // base, a leaked plan poisons the next graph that reuses the base
+    // (stale skips join fresh ones and the CPU tier's row bookkeeping
+    // waits on work that never exists: the C3 hang). Called from the
+    // scheduler's step-end hook, the one point where no op can be
+    // mid-dispatch. Returns the number purged; counts them in stats.
+    size_t hybrid_purge_stale();
+
+    // Async admission fills: retire completed copies (making their
+    // projections servable) and enqueue this step's reservations on the
+    // transfer queue. Called from the scheduler's step-end hook. No-op
+    // unless cfg.async_fill was set.
+    void async_fill_flush_step();
 
     // The staging hook refills this device base with raw GGUF-layout
     // bytes on every graph run.  opt_for_reorder_id must never in-place
@@ -462,6 +514,28 @@ private:
     bool m_use_slru = false;
     int m_protected_limit = 0;   // max protected-segment slots
     uint64_t m_tick = 0;
+
+    // Async-fill state. m_pending_fills holds reservations made by
+    // promote_projection this step; flush moves them to m_inflight_fills
+    // with a device event. m_fill_seq stamps reservations so a reset()
+    // in between invalidates them (the copy still lands in the pool --
+    // harmlessly -- but the slot is never marked filled).
+    bool m_async_fill = false;
+    void * m_transfer_queue = nullptr;
+    struct pending_fill {
+        int slot_id = -1;
+        int projection = -1;
+        const void * host_src = nullptr;
+        size_t bytes = 0;
+        uint64_t seq = 0;
+    };
+    struct inflight_fill {
+        pending_fill req;
+        void * event = nullptr;
+    };
+    std::vector<pending_fill>  m_pending_fills;
+    std::vector<inflight_fill> m_inflight_fills;
+    uint64_t m_fill_seq = 0;
 
     mutable std::mutex m_mutex;  // protects slots, layer index, miss counts, phase
     std::vector<moe_cache_slot> m_slots;

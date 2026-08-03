@@ -40,6 +40,11 @@ static void device_path_unreachable(const char * what) {
 void * moe_cache_device_alloc(size_t, void *) { device_path_unreachable("alloc"); return nullptr; }
 void   moe_cache_device_free(void *, void *) { device_path_unreachable("free"); }
 bool   moe_cache_device_copy(void *, const void *, size_t, void *) { device_path_unreachable("copy"); return false; }
+void * moe_cache_device_create_transfer_queue(void *) { device_path_unreachable("create_transfer_queue"); return nullptr; }
+void   moe_cache_device_destroy_transfer_queue(void *) { device_path_unreachable("destroy_transfer_queue"); }
+void * moe_cache_device_copy_async_after(void *, const void *, size_t, void *, void *) { device_path_unreachable("copy_async_after"); return nullptr; }
+bool   moe_cache_device_event_complete(void *) { device_path_unreachable("event_complete"); return false; }
+void   moe_cache_device_event_free(void *) { device_path_unreachable("event_free"); }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -646,6 +651,91 @@ static void test_hybrid_purge_drops_pending_plans() {
     CHECK(cache.hybrid_take_plan(cpy_a).empty());
 }
 
+static void test_step_end_purges_leaked_plans() {
+    // A plan recorded during a graph but never taken by its op is a
+    // leak; hybrid_record_skip merges into an existing plan at the same
+    // (reused) staged base, so a leaked plan from graph N poisons graph
+    // N+1 -- the C3 hang class. The step-end purge kills it.
+    CASE("hybrid plan: step-end purge kills leaked plans");
+    moe_expert_cache cache;
+    CHECK(cache.init(make_config(4), nullptr));
+
+    char base[8], w[8];
+    cache.hybrid_record_skip(base, 3, w, 0);
+    CHECK(cache.hybrid_plan_pending(base));
+    CHECK_EQ((long long)cache.hybrid_purge_stale(), 1LL);
+    CHECK(!cache.hybrid_plan_pending(base));
+
+    // The next graph records fresh skips at the same base: only they
+    // survive to be taken.
+    cache.hybrid_record_skip(base, 5, w + 4, 0);
+    auto plan = cache.hybrid_take_plan(base);
+    CHECK_EQ((long long)plan.skips.size(), 1LL);
+    CHECK(plan.has_expert(5));
+    CHECK(!plan.has_expert(3));
+    CHECK_EQ((long long)cache.stats().hybrid_stale_plans_purged.load(), 1LL);
+    CHECK_EQ((long long)cache.hybrid_purge_stale(), 0LL);
+}
+
+static void test_async_fill_reserves_then_serves_after_flush() {
+    // Async mode: a promotion only reserves; the projection is invisible
+    // until the step-end flush lands the copy (host-only: immediately).
+    CASE("async fill: invisible until flushed, then a hit");
+    moe_expert_cache cache;
+    auto cfg = make_config(4, /*admission=*/1);
+    cfg.async_fill = true;
+    CHECK(cache.init(cfg, nullptr));
+
+    const auto w = weights(0x5A);
+    CHECK(cache.lookup(0, 0, GATE, PROJ_BYTES, w.data()) == nullptr);
+    cache.record_miss(0, 0, GATE);
+    CHECK(cache.promote_projection(0, 0, GATE, w.data(), PROJ_BYTES) == nullptr);
+    // Reserved but pending: still a miss, but the slot is held.
+    CHECK(cache.lookup(0, 0, GATE, PROJ_BYTES, w.data()) == nullptr);
+    CHECK_EQ(cache.slots_used(), 1);
+
+    cache.async_fill_flush_step();
+    void * got = cache.lookup(0, 0, GATE, PROJ_BYTES, w.data());
+    CHECK(got != nullptr);
+    CHECK(got && memcmp(got, w.data(), PROJ_BYTES) == 0);
+    CHECK_EQ((long long)cache.stats().async_fills_completed.load(), 1LL);
+
+    // A reservation made before reset() must not land after it.
+    cache.record_miss(1, 1, GATE);
+    CHECK(cache.promote_projection(1, 1, GATE, w.data(), PROJ_BYTES) == nullptr);
+    cache.reset();
+    cache.async_fill_flush_step();
+    CHECK(cache.lookup(1, 1, GATE, PROJ_BYTES, w.data()) == nullptr);
+}
+
+static void test_async_fill_pending_slot_is_not_evicted() {
+    // One slot, maximum pressure: while its fill is pending it must be
+    // declined as a victim, not overwritten under the queued copy.
+    CASE("async fill: a pending slot never becomes an eviction victim");
+    moe_expert_cache cache;
+    auto cfg = make_config(1, /*admission=*/1);
+    cfg.async_fill = true;
+    CHECK(cache.init(cfg, nullptr));
+
+    const auto w1 = weights(0x11), w2 = weights(0x22);
+    cache.record_miss(0, 0, GATE);
+    CHECK(cache.promote_projection(0, 0, GATE, w1.data(), PROJ_BYTES) == nullptr);
+    // Another expert wants the only slot while its fill is pending.
+    cache.record_miss(0, 1, GATE);
+    CHECK(cache.promote_projection(0, 1, GATE, w2.data(), PROJ_BYTES) == nullptr);
+    CHECK_EQ(cache.slots_used(), 1);
+
+    cache.async_fill_flush_step();
+    CHECK(cache.lookup(0, 0, GATE, PROJ_BYTES, w1.data()) != nullptr);
+
+    // Once landed, the slot is a normal eviction candidate again.
+    cache.record_miss(0, 1, GATE);
+    CHECK(cache.promote_projection(0, 1, GATE, w2.data(), PROJ_BYTES) == nullptr);
+    cache.async_fill_flush_step();
+    CHECK(cache.lookup(0, 1, GATE, PROJ_BYTES, w2.data()) != nullptr);
+    CHECK(cache.lookup(0, 0, GATE, PROJ_BYTES, w1.data()) == nullptr);
+}
+
 static void test_staged_bases_survive_reset() {
     // Reorder safety: a base the hook has ever staged into must stay
     // marked. Clearing on reset() could race a stage already in flight,
@@ -953,6 +1043,9 @@ int main() {
     test_hybrid_plan_roundtrip_and_single_take();
     test_hybrid_plans_are_isolated_per_staged_tensor();
     test_hybrid_purge_drops_pending_plans();
+    test_step_end_purges_leaked_plans();
+    test_async_fill_reserves_then_serves_after_flush();
+    test_async_fill_pending_slot_is_not_evicted();
     test_staged_bases_survive_reset();
     test_admission_blocked_by_phase_tracks_prefill_policy();
     test_concurrent_use_and_reset_survive();

@@ -27,6 +27,15 @@ int moe_cache_parse_projection(const char * name) {
 }
 
 moe_expert_cache::~moe_expert_cache() {
+    // Destroy the transfer queue FIRST: it waits out any in-flight fill,
+    // so nothing can write into the pool after it is freed below.
+    if (m_transfer_queue) {
+        moe_cache_device_destroy_transfer_queue(m_transfer_queue);
+        m_transfer_queue = nullptr;
+    }
+    for (auto & f : m_inflight_fills) {
+        if (f.event) moe_cache_device_event_free(f.event);
+    }
     // Slots point into one pool allocation; freeing the pool frees them all.
     if (m_pool) {
         if (m_host_only) {
@@ -64,6 +73,7 @@ bool moe_expert_cache::init(const moe_cache_config & cfg, void * queue) {
     m_is_prefill      = false;
     m_use_slru        = (cfg.policy == "slru");
     m_mmap_advise     = cfg.mmap_advise;
+    m_async_fill      = cfg.async_fill;
     m_deferred        = false;
 
     // Projection sizes are taken individually rather than assumed equal, so
@@ -100,6 +110,7 @@ bool moe_expert_cache::init_deferred(const moe_cache_config & cfg, void * queue)
     m_is_prefill      = false;
     m_use_slru        = (cfg.policy == "slru");
     m_mmap_advise     = cfg.mmap_advise;
+    m_async_fill      = cfg.async_fill;
     m_deferred        = true;
     m_initialized     = false;
     return true;
@@ -223,6 +234,16 @@ bool moe_expert_cache::finalize_geometry_locked() {
     }
 
     m_miss_counts.assign((size_t)m_n_layers * m_n_experts * MOE_CACHE_N_PROJECTIONS, 0);
+
+    if (m_async_fill && !m_host_only) {
+        m_transfer_queue = moe_cache_device_create_transfer_queue(m_queue);
+        if (!m_transfer_queue) {
+            fprintf(stderr, "moe_cache: transfer queue unavailable -- "
+                            "async fills disabled, promote copies stay synchronous\n");
+            m_async_fill = false;
+        }
+    }
+
     m_initialized = true;
     m_stats.reset();
     return true;
@@ -379,6 +400,7 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
         slot.key = {layer, expert};
         slot.occupied = true;
         slot.filled_mask = 0;
+        slot.pending_mask = 0;
         slot.last_access = m_tick;
         slot.access_count = 1;
         slot.protected_seg = false;
@@ -401,6 +423,23 @@ void * moe_expert_cache::promote_projection(int32_t layer, int32_t expert,
         default: return nullptr;
     }
     if (bytes == 0) return nullptr;
+
+    if (m_async_fill) {
+        // Reserve only. The copy happens at step end on the transfer
+        // queue; until its event completes the projection is pending, so
+        // lookups keep missing and the hook treats this exactly like a
+        // declined promotion (hybrid CPU tier or scheduler staging) --
+        // which is what returning nullptr makes it do. No fill ever
+        // rides the compute stream.
+        if (slot.pending_mask & bit) {
+            return nullptr;  // already queued
+        }
+        slot.pending_mask |= bit;
+        m_pending_fills.push_back({slot_id, projection, host_src, bytes, m_fill_seq});
+        m_stats.async_fills_enqueued++;
+        m_miss_counts[idx] = 0;
+        return nullptr;
+    }
 
     if (m_host_only) {
         // Unit-test mode: the "device" pool is host memory, so a plain
@@ -456,6 +495,120 @@ moe_expert_cache::hybrid_plan moe_expert_cache::hybrid_take_plan(const void * cp
 void moe_expert_cache::hybrid_purge_plans() {
     std::lock_guard<std::mutex> lock(m_hybrid_mutex);
     m_hybrid_plans.clear();
+}
+
+size_t moe_expert_cache::hybrid_purge_stale() {
+    std::lock_guard<std::mutex> lock(m_hybrid_mutex);
+    const size_t n = m_hybrid_plans.size();
+    if (n > 0) {
+        m_hybrid_plans.clear();
+        m_stats.hybrid_stale_plans_purged += n;
+    }
+    return n;
+}
+
+void moe_expert_cache::async_fill_flush_step() {
+    if (!m_async_fill) return;
+
+    std::vector<pending_fill>  pending;
+    std::vector<inflight_fill> inflight;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        pending.swap(m_pending_fills);
+        inflight.swap(m_inflight_fills);
+    }
+
+    std::vector<inflight_fill> still;
+
+    // Retire completed fills from earlier steps: their projections become
+    // servable from the next lookup on.
+    for (auto & f : inflight) {
+        const bool done = !f.event || moe_cache_device_event_complete(f.event);
+        if (!done) {
+            still.push_back(f);
+            continue;
+        }
+        if (f.event) moe_cache_device_event_free(f.event);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (f.req.seq != m_fill_seq) {  // reset() since reservation
+            m_stats.async_fills_discarded++;
+            continue;
+        }
+        moe_cache_slot & s = m_slots[f.req.slot_id];
+        const uint8_t bit = (uint8_t)(1u << f.req.projection);
+        if (!s.occupied || (s.pending_mask & bit) == 0) {
+            m_stats.async_fills_discarded++;
+            continue;
+        }
+        s.pending_mask = (uint8_t)(s.pending_mask & ~bit);
+        s.filled_mask  = (uint8_t)(s.filled_mask | bit);
+        s.proj_origin[f.req.projection] = f.req.host_src;
+        m_stats.async_fills_completed++;
+        m_stats.async_fill_bytes += f.req.bytes;
+    }
+
+    // Enqueue this step's reservations. The barrier dependency orders
+    // each copy after the graph's already-submitted compute, so a reused
+    // slot's old bytes cannot be overwritten under a still-running
+    // reader.
+    for (auto & p : pending) {
+        void * dst = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (p.seq != m_fill_seq) {
+                m_stats.async_fills_discarded++;
+                continue;
+            }
+            moe_cache_slot & s = m_slots[p.slot_id];
+            const uint8_t bit = (uint8_t)(1u << p.projection);
+            if (!s.occupied || (s.pending_mask & bit) == 0) {
+                m_stats.async_fills_discarded++;
+                continue;
+            }
+            size_t off = 0;
+            switch (p.projection) {
+                case 0: off = s.gate_offset; break;
+                case 1: off = s.up_offset;   break;
+                case 2: off = s.down_offset; break;
+            }
+            dst = (char *)s.device_ptr + off;
+        }
+        if (m_host_only) {
+            // Unit-test mode: the pool is host memory; the fill lands
+            // immediately and the projection is servable right away.
+            memcpy(dst, p.host_src, p.bytes);
+            std::lock_guard<std::mutex> lock(m_mutex);
+            moe_cache_slot & s = m_slots[p.slot_id];
+            const uint8_t bit = (uint8_t)(1u << p.projection);
+            s.pending_mask = (uint8_t)(s.pending_mask & ~bit);
+            s.filled_mask  = (uint8_t)(s.filled_mask | bit);
+            s.proj_origin[p.projection] = p.host_src;
+            m_stats.async_fills_completed++;
+            m_stats.async_fill_bytes += p.bytes;
+            continue;
+        }
+        void * ev = moe_cache_device_copy_async_after(dst, p.host_src, p.bytes,
+                                                      m_transfer_queue, m_queue);
+        if (!ev) {
+            // Submission failed: drop the reservation. The projection
+            // simply stays uncached (fail-safe, not fail-wrong).
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (p.seq == m_fill_seq) {
+                m_slots[p.slot_id].pending_mask =
+                    (uint8_t)(m_slots[p.slot_id].pending_mask & ~(1u << p.projection));
+            }
+            m_stats.async_fills_discarded++;
+            continue;
+        }
+        still.push_back({p, ev});
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto & f : still) {
+            m_inflight_fills.push_back(f);
+        }
+    }
 }
 
 void moe_expert_cache::advise_note_use(const void * host_src, size_t bytes) {
@@ -575,6 +728,7 @@ void moe_expert_cache::reset() {
         slot.access_count = 0;
         slot.protected_seg = false;
         slot.filled_mask = 0;
+        slot.pending_mask = 0;
         for (int p = 0; p < MOE_CACHE_N_PROJECTIONS; p++) {
             slot.proj_origin[p] = nullptr;
         }
@@ -584,6 +738,12 @@ void moe_expert_cache::reset() {
     }
     std::fill(m_miss_counts.begin(), m_miss_counts.end(), 0);
     m_tick = 0;
+    // Invalidate async-fill reservations: queued ones are dropped here,
+    // in-flight ones are discarded at retirement by the sequence bump
+    // (their copies still land in the pool, harmlessly -- the slots are
+    // simply never marked filled).
+    m_fill_seq++;
+    m_pending_fills.clear();
     // Administrative clear, not cache pressure: drop the advice batches
     // without firing them (a /cache/reset between benchmark conditions
     // must not yank the page cache out from under the next condition).
@@ -625,6 +785,13 @@ std::string moe_expert_cache::stats_json() const {
     ss << "\"decode_misses\":" << m_stats.decode_misses.load() << ",";
     ss << "\"slru_promotions\":" << m_stats.slru_promotions.load() << ",";
     ss << "\"slru_demotions\":" << m_stats.slru_demotions.load() << ",";
+    ss << "\"hybrid_stale_plans_purged\":" << m_stats.hybrid_stale_plans_purged.load() << ",";
+    ss << "\"async_fills_enqueued\":" << m_stats.async_fills_enqueued.load() << ",";
+    ss << "\"async_fills_completed\":" << m_stats.async_fills_completed.load() << ",";
+    ss << "\"async_fills_discarded\":" << m_stats.async_fills_discarded.load() << ",";
+    ss << "\"async_fill_bytes\":" << m_stats.async_fill_bytes.load() << ",";
+    ss << "\"async_fills_pending\":"
+       << (unsigned long long)(m_pending_fills.size() + m_inflight_fills.size()) << ",";
     ss << "\"advise_willneed\":" << m_stats.advise_willneed.load() << ",";
     ss << "\"advise_dontneed\":" << m_stats.advise_dontneed.load() << ",";
     ss << "\"advise_dropped\":" << m_stats.advise_dropped.load() << ",";
@@ -651,6 +818,7 @@ int moe_expert_cache::evict_lru() {
     uint64_t oldest = UINT64_MAX;
     for (int i = 0; i < (int)m_slots.size(); i++) {
         if (m_slots[i].occupied && !m_slots[i].protected_seg &&
+            m_slots[i].pending_mask == 0 &&
             m_slots[i].last_access < oldest) {
             oldest = m_slots[i].last_access;
             victim = i;
@@ -673,6 +841,7 @@ int moe_expert_cache::evict_slru() {
     // First pass: probationary (non-protected) slots.
     for (int i = 0; i < (int)m_slots.size(); i++) {
         if (m_slots[i].occupied && !m_slots[i].protected_seg &&
+            m_slots[i].pending_mask == 0 &&
             m_slots[i].last_access < oldest) {
             oldest = m_slots[i].last_access;
             victim = i;
@@ -685,6 +854,7 @@ int moe_expert_cache::evict_slru() {
     oldest = UINT64_MAX;
     for (int i = 0; i < (int)m_slots.size(); i++) {
         if (m_slots[i].occupied && m_slots[i].protected_seg &&
+            m_slots[i].pending_mask == 0 &&
             m_slots[i].last_access < oldest) {
             oldest = m_slots[i].last_access;
             victim = i;

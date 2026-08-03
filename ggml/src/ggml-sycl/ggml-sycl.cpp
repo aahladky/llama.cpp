@@ -4800,6 +4800,15 @@ static void moe_cache_lazy_init(ggml_backend_sycl_context & ctx,
     cfg.policy = (const char *)g_moe_cache_policy;
     cfg.admission_misses = (int)g_moe_cache_admission;
     cfg.prefill_admit = g_moe_cache_prefill_admit;
+    // Async admission fills: reserve at miss time, copy on a dedicated
+    // transfer queue at step end (ordered after compute by a barrier).
+    // Default ON; GGML_MOE_CACHE_ASYNC_FILL=0 restores the synchronous
+    // promote-copy path for A/B comparison.
+    static const bool async_fill_on = [] {
+        const char * env = getenv("GGML_MOE_CACHE_ASYNC_FILL");
+        return env == nullptr || atoi(env) > 0;
+    }();
+    cfg.async_fill = async_fill_on;
     // SSD/mmap-tier advice is opt-in: on a box where the model is
     // RAM-comfortable, DONTNEED would drop resident pages for no benefit.
     // The bridge is registered by llama-mmap at model load, which happens
@@ -5083,6 +5092,16 @@ static void moe_cache_step_end(void) {
             cache = g_moe_cache_registry[dev].lock();
         }
         if (cache) {
+            // Purge plans that survived this graph. A plan not taken by
+            // its op is leaked, and hybrid_record_skip MERGES into an
+            // existing plan at the same staged base -- so a leaked plan
+            // poisons the next graph that reuses the base and the CPU
+            // tier's row bookkeeping waits forever (the C3 hang).
+            // Between graphs is the one safe purge point.
+            cache->hybrid_purge_stale();
+            // Async admission fills: retire completed copies, enqueue
+            // this step's reservations on the transfer queue.
+            cache->async_fill_flush_step();
             cache->advise_flush_step();
             if (moe_fp_enabled()) {
                 const moe_cache_stats & st = cache->stats();
