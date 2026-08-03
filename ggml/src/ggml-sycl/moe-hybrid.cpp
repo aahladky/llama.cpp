@@ -116,7 +116,7 @@ public:
             m_body     = &body;
             m_helpers  = n_workers - 1;
             m_pending.store(m_helpers, std::memory_order_relaxed);
-            m_generation.fetch_add(1, std::memory_order_release);
+            m_batch_gen = m_generation.fetch_add(1, std::memory_order_release) + 1;
         }
         m_wake.notify_all();
         // The helpers hold a pointer to body and are running it right
@@ -135,9 +135,19 @@ public:
         for (int i = 0; i < 4096 && m_pending.load(std::memory_order_acquire); i++) {
             std::this_thread::yield();
         }
-        if (m_pending.load(std::memory_order_acquire) != 0) {
+        if (m_pending.load(std::memory_order_acquire) > 0) {
             std::unique_lock<std::mutex> lock(m_mutex);
-            m_done.wait(lock, [&] { return m_pending.load(std::memory_order_acquire) == 0; });
+            m_done.wait(lock, [&] { return m_pending.load(std::memory_order_acquire) <= 0; });
+        }
+        if (m_pending.load(std::memory_order_acquire) < 0) {
+            // A helper executed a batch it was not counted in. The
+            // generation gate in worker_main makes this unreachable; if
+            // it ever fires anyway, say so once rather than hanging.
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                fprintf(stderr, "moe_hybrid: pool pending went negative -- "
+                                "batch attribution bug, please report\n");
+            }
         }
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -213,7 +223,17 @@ private:
             const std::function<void(int)> * body = nullptr;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                if (m_body && id <= m_helpers) {
+                // The generation gate: a worker preempted between
+                // adopting `seen` and reaching this lock can find a LATER
+                // batch published here. Without the m_batch_gen check it
+                // would execute that batch under its stale generation,
+                // then adopt the new generation and execute it AGAIN --
+                // two decrements for one slot, m_pending goes negative,
+                // and run() waits forever on == 0. Observed live on
+                // 2026-08-02 (gdb on the hung server: m_pending == -1,
+                // all workers idle, caller parked in m_done.wait): the
+                // C3 maiden-run hang.
+                if (m_body && id <= m_helpers && m_batch_gen == seen) {
                     body = m_body;
                 }
             }
@@ -235,6 +255,9 @@ private:
     std::vector<std::thread> m_workers;
     const std::function<void(int)> * m_body = nullptr;
     std::atomic<uint64_t>    m_generation{0};
+    // Generation of the batch currently published in m_body/m_helpers.
+    // Written and read only under m_mutex.
+    uint64_t                 m_batch_gen = 0;
     std::atomic<int>         m_pending{0};
     int                      m_helpers = 0;
     int                      m_size    = 0;
