@@ -51,6 +51,11 @@ static void device_path_unreachable(const char * what) {
 void * moe_cache_device_alloc(size_t, void *) { device_path_unreachable("alloc"); return nullptr; }
 void   moe_cache_device_free(void *, void *) { device_path_unreachable("free"); }
 bool   moe_cache_device_copy(void *, const void *, size_t, void *) { device_path_unreachable("copy"); return false; }
+void * moe_cache_device_create_transfer_queue(void *) { device_path_unreachable("create_transfer_queue"); return nullptr; }
+void   moe_cache_device_destroy_transfer_queue(void *) { device_path_unreachable("destroy_transfer_queue"); }
+void * moe_cache_device_copy_async_after(void *, const void *, size_t, void *, void *) { device_path_unreachable("copy_async_after"); return nullptr; }
+bool   moe_cache_device_event_complete(void *) { device_path_unreachable("event_complete"); return false; }
+void   moe_cache_device_event_free(void *) { device_path_unreachable("event_free"); }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
